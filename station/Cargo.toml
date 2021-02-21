@@ -1,0 +1,16 @@
+[package]
+name = "station"
+description = "A network-based interprocess communication (IPC) library."
+documentation = "https://docs.rs/station"
+repository = "https://github.com/domagalski/station-rs"
+homepage = "https://github.com/domagalski/station-rs"
+keywords = ["station", "ipc", "pubsub", "rpc",  "network"]
+categories = ["command-line-utilities", "network-programming"]
+readme = "README.md"
+license = "MIT"
+version = "0.0.0"
+authors = ["Rachel Domagalski"]
+edition = "2018"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
