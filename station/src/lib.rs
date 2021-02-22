@@ -1,7 +1,11 @@
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+//! Station
+//!
+//! This crate for IPC communication over a network with multiple machines or locally with a single
+//! machine. The implemented IPC patterns are IPC via a publish-subscribe model as well as a
+//! request-response model. This library aims for flexibility in the networking protocol used to
+//! transmit messages.
+
+//pub mod process;
+//pub mod pubsub;
+pub mod rpc;
+//pub mod station;
