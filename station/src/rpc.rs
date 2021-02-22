@@ -1,3 +1,4 @@
+use std::any;
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::io::{Error as IoError, ErrorKind, Read, Write};
@@ -211,6 +212,22 @@ fn write_stream(stream: &mut impl ReadWrite, data: impl Serialize) -> Result<usi
     stream.write(&message)
 }
 
+fn ping(stream: &mut impl ReadWrite) -> bool {
+    let mut signal: [u8; HEADER_SIZE] = [0; HEADER_SIZE];
+    BE::write_u32(&mut signal, PING_KEYWORD);
+    match stream.write(&signal) {
+        Ok(size) => log::trace!("wrote ping requested signal of {} bytes", size),
+        Err(err) => {
+            log::trace!("ping request had error: {}", err);
+            return false;
+        }
+    }
+
+    // TODO wait for a response
+
+    return true;
+}
+
 fn recv<T: DeserializeOwned + Serialize>(
     stream: &mut impl Read,
     is_result_type: bool,
@@ -254,24 +271,43 @@ fn recv<T: DeserializeOwned + Serialize>(
             return Err(IoError::new(ErrorKind::InvalidData, mismatch_error));
         }
 
+        let buffer = &buffer[..n_bytes];
         message_bytes.append(&mut buffer.to_vec());
     }
 
     if is_result_type {
         let response: Result<T, String> = match bincode::deserialize(&message_bytes) {
             Ok(resp) => resp,
-            Err(err) => return Err(IoError::new(ErrorKind::InvalidInput, format!("{}", err))),
+            Err(_) => {
+                let err_str = format!(
+                    "failed to deserialize to {}",
+                    any::type_name::<Result<T, String>>()
+                );
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("{}", err_str),
+                ));
+            }
         };
 
         match response {
             Ok(resp) => Ok(resp),
-            Err(err) => Err(IoError::new(ErrorKind::ConnectionAborted, err.to_string())),
+            Err(err) => Err(IoError::new(
+                ErrorKind::Other,
+                format!("RpcError: {}", err.to_string()),
+            )),
         }
     } else {
         let message_bytes = message_bytes.as_slice();
         match bincode::deserialize(&message_bytes) {
             Ok(message) => Ok(message),
-            Err(err) => Err(IoError::new(ErrorKind::InvalidInput, format!("{}", err))),
+            Err(_) => {
+                let err_str = format!("failed to deserialize to {}", any::type_name::<T>());
+                Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("{}", err_str),
+                ))
+            }
         }
     }
 }
@@ -391,19 +427,7 @@ where
             Err(_) => return false,
         };
 
-        let mut signal: [u8; HEADER_SIZE] = [0; HEADER_SIZE];
-        BE::write_u32(&mut signal, PING_KEYWORD);
-        match stream.write(&signal) {
-            Ok(size) => log::trace!("wrote ping requested signal of {} bytes", size),
-            Err(err) => {
-                log::trace!("ping request had error: {}", err);
-                return false;
-            }
-        }
-
-        // TODO wait for a response
-
-        return true;
+        ping(&mut stream)
     }
 }
 
@@ -412,12 +436,13 @@ mod tests {
     use std::time::Duration;
 
     use portpicker;
+    use regex::Regex;
     use test_env_log::test;
 
     use super::*;
 
     #[test]
-    fn start_stop_server() {
+    fn start_stop_server_tcp() {
         let port: u16 = portpicker::pick_unused_port().unwrap();
         let mut server: RpcServer =
             RpcServer::with_tcp_port::<i32, ()>("test", port, Box::new(|_| Ok(())));
@@ -428,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn test_client() {
+    fn test_client_tcp() {
         let port: u16 = portpicker::pick_unused_port().unwrap();
 
         let server: RpcServer =
@@ -442,5 +467,72 @@ mod tests {
         }
         let response = client.call(1);
         assert_eq!(response.unwrap(), 2);
+    }
+
+    #[test]
+    fn test_callback_with_errors_tcp() {
+        let port: u16 = portpicker::pick_unused_port().unwrap();
+
+        let server: RpcServer = RpcServer::with_tcp_port::<i32, i32>(
+            "test",
+            port,
+            Box::new(|_| Err(String::from("callback example error"))),
+        );
+        assert!(server.is_running());
+
+        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let client: RpcClient<i32, i32> = RpcClient::with_tcp_addr(addr);
+        while !client.ping() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let response = client.call(0);
+        let err = response.unwrap_err().to_string();
+        let re = Regex::new(r"RpcError:").unwrap();
+        assert!(re.is_match(&err));
+    }
+
+    #[test]
+    fn test_mismatched_types_tcp() {
+        let port: u16 = portpicker::pick_unused_port().unwrap();
+
+        let server: RpcServer =
+            RpcServer::with_tcp_port::<i32, i32>("test", port, Box::new(|x| Ok(x + 1)));
+        assert!(server.is_running());
+
+        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let client: RpcClient<String, String> = RpcClient::with_tcp_addr(addr);
+        while !client.ping() {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let response = client.call(String::from("hello"));
+        let err = response.unwrap_err().to_string();
+        let re = Regex::new(r"failed to deserialize").unwrap();
+        assert!(re.is_match(&err));
+    }
+
+    #[test]
+    fn test_large_data_tcp() {
+        let port: u16 = portpicker::pick_unused_port().unwrap();
+
+        let server: RpcServer =
+            RpcServer::with_tcp_port::<String, usize>("test", port, Box::new(|x| Ok(x.len())));
+        assert!(server.is_running());
+
+        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let client: RpcClient<String, usize> = RpcClient::with_tcp_addr(addr);
+        while !client.ping() {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let size = BUFFER_SIZE + BUFFER_SIZE / 2;
+        let mut request = String::new();
+        while request.len() < size {
+            request += "adsfadfasdfasdfasdfasdfasdfsadf";
+        }
+        let size = request.len();
+
+        let response = client.call(request);
+        assert_eq!(response.unwrap(), size);
     }
 }
