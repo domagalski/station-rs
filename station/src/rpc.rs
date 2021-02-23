@@ -1,6 +1,7 @@
 use std::any;
 use std::cell::RefCell;
-use std::fmt::Debug;
+use std::error::Error;
+use std::fmt::{Debug, Display, Error as FmtError, Formatter};
 use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::mem;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -10,8 +11,10 @@ use std::thread::{self, JoinHandle};
 
 use bincode;
 use byteorder::{ByteOrder, BE};
+use lazy_static;
 use log;
 use parking_lot::RwLock;
+use regex::Regex;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -43,6 +46,55 @@ enum ListenPort {
 enum SendPort {
     TcpSocket(SocketAddr),
 }
+
+/// Possible responses to RPC calls that do not contain callback output.
+#[derive(Debug)]
+pub enum RpcError {
+    IoError(IoError),
+    RpcError(String),
+}
+
+impl RpcError {
+    /// Return True if the `RpcError` contains an IO Error.
+    pub fn is_io(&self) -> bool {
+        match self {
+            RpcError::IoError(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Return True if the `RpcError` contains an RPC Error.
+    pub fn is_rpc(&self) -> bool {
+        match self {
+            RpcError::RpcError(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Unwrap an IO Error if one exists, else panic.
+    pub fn unwrap_io(&self) -> &IoError {
+        match self {
+            RpcError::IoError(err) => err,
+            _ => panic!("The RpcError is not an IO Error, got {:?}", self),
+        }
+    }
+
+    /// Unwrap an RPC error message if one exists, else panic.
+    pub fn unwrap_rpc(&self) -> &str {
+        match self {
+            RpcError::RpcError(err) => err,
+            _ => panic!("The RpcError is not an RPC error message, got {:?}", self),
+        }
+    }
+}
+
+impl Display for RpcError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl Error for RpcError {}
 
 /// The RPC server listens for incoming messages of type `T`, processes them, and returns a result
 /// containing bytes that can be deserialized to the type `U`.
@@ -167,6 +219,7 @@ impl Drop for RpcServer {
     }
 }
 
+/// The RPC client sends data of type `T` to a server and expects a response of type `U`.
 pub struct RpcClient<T, U> {
     sender: Box<dyn RpcSender<T, U>>,
 }
@@ -183,14 +236,40 @@ where
         RpcClient { sender }
     }
 
+    /// Create an RPC client pointing to a TCP socket address.
     pub fn with_tcp_addr(addr: SocketAddr) -> RpcClient<T, U> {
         RpcClient::new(SendPort::TcpSocket(addr))
     }
 
-    pub fn call(&self, request: T) -> Result<U, IoError> {
-        self.sender.send_recv(request)
+    /// Call the RPC and return the response.
+    pub fn call(&self, request: T) -> Result<U, RpcError> {
+        match self.sender.send_recv(request) {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                match err.kind() {
+                    ErrorKind::Other => {
+                        let err_str = err.to_string();
+                        lazy_static::lazy_static! {
+                            static ref RE: Regex = Regex::new(r"RpcError: ").unwrap();
+                        }
+
+                        if RE.is_match(&err_str) {
+                            // there should be two items in the split, where the second one is the
+                            // actual string. this should not actually panic.
+                            let mut split = RE.split(&err_str);
+                            split.next();
+                            Err(RpcError::RpcError(split.next().unwrap().to_string()))
+                        } else {
+                            Err(RpcError::IoError(err))
+                        }
+                    }
+                    _ => Err(RpcError::IoError(err)),
+                }
+            }
+        }
     }
 
+    /// Check if the corresponding RPC server is online.
     pub fn ping(&self) -> bool {
         self.sender.ping()
     }
@@ -436,7 +515,6 @@ mod tests {
     use std::time::Duration;
 
     use portpicker;
-    use regex::Regex;
     use test_env_log::test;
 
     use super::*;
@@ -447,7 +525,6 @@ mod tests {
         let mut server: RpcServer =
             RpcServer::with_tcp_port::<i32, ()>("test", port, Box::new(|_| Ok(())));
         assert!(server.is_running());
-        //std::thread::sleep(std::time::Duration::from_secs(1));
         server.stop();
         assert!(!server.is_running());
     }
@@ -486,9 +563,11 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         let response = client.call(0);
-        let err = response.unwrap_err().to_string();
-        let re = Regex::new(r"RpcError:").unwrap();
-        assert!(re.is_match(&err));
+        let err = response.unwrap_err();
+        assert!(err.is_rpc());
+        assert!(!err.is_io());
+        let err = err.unwrap_rpc();
+        assert_eq!(err, "callback example error");
     }
 
     #[test]
@@ -506,7 +585,10 @@ mod tests {
         }
 
         let response = client.call(String::from("hello"));
-        let err = response.unwrap_err().to_string();
+        let err = response.unwrap_err();
+        assert!(!err.is_rpc());
+        assert!(err.is_io());
+        let err = err.to_string();
         let re = Regex::new(r"failed to deserialize").unwrap();
         assert!(re.is_match(&err));
     }
