@@ -25,4 +25,5 @@ serde = { version = "1.0", features = ["derive"] }
 [dev-dependencies]
 env_logger = "0.8"
 portpicker = "0.1"
+tempfile = "3"
 test-env-log = "0.2"

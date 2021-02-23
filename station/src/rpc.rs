@@ -6,6 +6,8 @@ use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::mem;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::ops::Drop;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -23,6 +25,7 @@ type Callback<T, U> = Box<dyn Send + Fn(T) -> Result<U, String>>;
 
 trait ReadWrite: Read + Write {}
 impl ReadWrite for TcpStream {}
+impl ReadWrite for UnixStream {}
 
 // size of the buffer for incoming messages
 const BUFFER_SIZE: usize = 2048;
@@ -35,16 +38,16 @@ const MESSAGE_KEYWORD: u32 = 0xC0DEFEED;
 const STOP_KEYWORD: u32 = 0xC0DEDEAD;
 const HEADER_SIZE: usize = mem::size_of::<u32>() + mem::size_of::<u64>();
 
-// TODO unix domain sockets
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ListenPort {
     TcpPort(u16),
+    Unix(String),
 }
 
-// TODO unix domain sockets
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SendPort {
     TcpSocket(SocketAddr),
+    Unix(String),
 }
 
 /// Possible responses to RPC calls that do not contain callback output.
@@ -114,9 +117,11 @@ impl RpcServer {
     {
         let stop_requested = Arc::new(RwLock::new(false));
         let is_stop_requested = stop_requested.clone();
+        let thread_listen_port = listen_port.clone();
         let thread = thread::spawn(move || {
-            let listener: Box<dyn RpcListener<T, U>> = match listen_port {
+            let listener: Box<dyn RpcListener<T, U>> = match thread_listen_port {
                 ListenPort::TcpPort(port) => Box::new(TcpRpcListener::new(port)),
+                ListenPort::Unix(path) => Box::new(UnixRpcListener::new(Path::new(&path))),
             };
 
             while !*is_stop_requested.read() {
@@ -157,8 +162,6 @@ impl RpcServer {
 
     /// Create an RPC server bound to a TCP port.
     ///
-    /// Incoming messages will not be accepted until `RpcServer::start()` is called.
-    ///
     /// Args:
     /// * `name`: A name to refer to the RPC server.
     /// * `port`: The TCP port to bind the server to
@@ -169,6 +172,24 @@ impl RpcServer {
         U: Debug + DeserializeOwned + Serialize + 'static,
     {
         RpcServer::new(name, ListenPort::TcpPort(port), callback)
+    }
+
+    /// Create an RPC server bound to a Unix socket.
+    ///
+    /// Args:
+    /// * `name`: A name to refer to the RPC server.
+    /// * `path`: The unix socket path to bind the server to
+    /// * `callback`: The function to call on incoming data.
+    pub fn with_unix_socket<T, U>(
+        name: &'static str,
+        path: &str,
+        callback: Callback<T, U>,
+    ) -> RpcServer
+    where
+        T: Debug + DeserializeOwned + Serialize + 'static,
+        U: Debug + DeserializeOwned + Serialize + 'static,
+    {
+        RpcServer::new(name, ListenPort::Unix(String::from(path)), callback)
     }
 
     /// Check if the RPC server is running.
@@ -190,14 +211,31 @@ impl RpcServer {
         let mut signal: [u8; HEADER_SIZE] = [0; HEADER_SIZE];
         BE::write_u32(&mut signal, STOP_KEYWORD);
 
-        match self.listen_port {
-            ListenPort::TcpPort(port) => self.send_stop_signal_tcp(port, &signal),
+        match &self.listen_port {
+            ListenPort::TcpPort(port) => self.send_stop_signal_tcp(*port, &signal),
+            ListenPort::Unix(path) => self.send_stop_signal_unix(&path, &signal),
         }
     }
 
     fn send_stop_signal_tcp(&self, port: u16, signal: &[u8]) {
         let stream = TcpStream::connect(format!("127.0.0.1:{}", port));
         // the only reason why the TCP endpoint shouldn't connect is that the thread has already
+        // been shut down, in which case, not being able to connect to tell it to shut down is fine
+        if let Ok(mut stream) = stream {
+            match stream.write(signal) {
+                Ok(size) => log::trace!(
+                    "{}: wrote stop requested signal of {} bytes",
+                    self.name,
+                    size
+                ),
+                Err(err) => log::trace!("{}: stop request had error: {}", self.name, err),
+            }
+        }
+    }
+
+    fn send_stop_signal_unix(&self, path: &str, signal: &[u8]) {
+        let stream = UnixStream::connect(path);
+        // the only reason why the Unix endpoint shouldn't connect is that the thread has already
         // been shut down, in which case, not being able to connect to tell it to shut down is fine
         if let Ok(mut stream) = stream {
             match stream.write(signal) {
@@ -230,8 +268,9 @@ where
     U: DeserializeOwned + Serialize + 'static,
 {
     fn new(send_port: SendPort) -> RpcClient<T, U> {
-        let sender = match send_port {
+        let sender: Box<dyn RpcSender<T, U>> = match send_port {
             SendPort::TcpSocket(addr) => Box::new(TcpRpcSender::new(addr)),
+            SendPort::Unix(path) => Box::new(UnixRpcSender::new(&path)),
         };
         RpcClient { sender }
     }
@@ -239,6 +278,11 @@ where
     /// Create an RPC client pointing to a TCP socket address.
     pub fn with_tcp_addr(addr: SocketAddr) -> RpcClient<T, U> {
         RpcClient::new(SendPort::TcpSocket(addr))
+    }
+
+    /// Create an RPC client pointing to a Unix socket address.
+    pub fn with_unix_socket(path: &str) -> RpcClient<T, U> {
+        RpcClient::new(SendPort::Unix(String::from(path)))
     }
 
     /// Call the RPC and return the response.
@@ -479,6 +523,74 @@ where
     }
 }
 
+struct UnixRpcListener {
+    unix: UnixListener,
+    stream: RefCell<Option<UnixStream>>,
+}
+
+impl UnixRpcListener {
+    fn new(path: &Path) -> UnixRpcListener {
+        let listener =
+            UnixListener::bind(path).expect(&format!("Cannot bind to Unix socket: {:?}", path));
+        UnixRpcListener {
+            unix: listener,
+            stream: RefCell::new(None),
+        }
+    }
+
+    fn write_stream<T: Serialize>(&self, data: T) -> Result<usize, IoError> {
+        if self.stream.borrow().is_none() {
+            return Err(IoError::new(
+                ErrorKind::NotFound,
+                "TCP stream handler closed",
+            ));
+        }
+
+        let message = construct_message(data);
+        let response = self.stream.borrow().as_ref().unwrap().write(&message);
+        self.stream
+            .borrow()
+            .as_ref()
+            .take()
+            .unwrap()
+            .shutdown(Shutdown::Both)
+            .unwrap();
+        *self.stream.borrow_mut() = None;
+        response
+    }
+}
+
+impl<T, U> RpcListener<T, U> for UnixRpcListener
+where
+    T: DeserializeOwned + Serialize,
+    U: DeserializeOwned + Serialize,
+{
+    fn recv_request(&self) -> Result<T, IoError> {
+        if self.stream.borrow().is_some() {
+            return Err(IoError::new(
+                ErrorKind::AlreadyExists,
+                "TCP stream handler open",
+            ));
+        }
+
+        let (mut stream, _) = self.unix.accept()?;
+        let request = recv(&mut stream, false);
+        match request {
+            Ok(_) => *self.stream.borrow_mut() = Some(stream),
+            _ => (),
+        }
+        // TODO write the error
+        request
+    }
+
+    fn send_response(&self, resp: Result<U, String>) -> Result<(), IoError> {
+        match self.write_stream(resp) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 struct TcpRpcSender {
     addr: SocketAddr,
 }
@@ -510,11 +622,45 @@ where
     }
 }
 
+struct UnixRpcSender {
+    path: String,
+}
+
+impl UnixRpcSender {
+    fn new(path: &str) -> UnixRpcSender {
+        UnixRpcSender {
+            path: String::from(path),
+        }
+    }
+}
+
+impl<T, U> RpcSender<T, U> for UnixRpcSender
+where
+    T: DeserializeOwned + Serialize,
+    U: DeserializeOwned + Serialize,
+{
+    fn send_recv(&self, req: T) -> Result<U, IoError> {
+        let mut stream = UnixStream::connect(&self.path)?;
+        write_stream(&mut stream, req)?;
+        recv(&mut stream, true)
+    }
+
+    fn ping(&self) -> bool {
+        let mut stream = match UnixStream::connect(&self.path) {
+            Ok(stream) => stream,
+            Err(_) => return false,
+        };
+
+        ping(&mut stream)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use portpicker;
+    use tempfile;
     use test_env_log::test;
 
     use super::*;
@@ -524,6 +670,18 @@ mod tests {
         let port: u16 = portpicker::pick_unused_port().unwrap();
         let mut server: RpcServer =
             RpcServer::with_tcp_port::<i32, ()>("test", port, Box::new(|_| Ok(())));
+        assert!(server.is_running());
+        server.stop();
+        assert!(!server.is_running());
+    }
+
+    #[test]
+    fn start_stop_server_unix() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let socket = tempdir.path().join("socket");
+        let socket = socket.as_path().to_str().unwrap();
+        let mut server: RpcServer =
+            RpcServer::with_unix_socket::<i32, ()>("test", socket, Box::new(|_| Ok(())));
         assert!(server.is_running());
         server.stop();
         assert!(!server.is_running());
@@ -547,6 +705,24 @@ mod tests {
     }
 
     #[test]
+    fn test_client_unix() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let socket = tempdir.path().join("socket");
+        let socket = socket.as_path().to_str().unwrap();
+        let server: RpcServer =
+            RpcServer::with_unix_socket::<i32, i32>("test", socket, Box::new(|x| Ok(x + 1)));
+        assert!(server.is_running());
+
+        let client: RpcClient<i32, i32> = RpcClient::with_unix_socket(socket);
+
+        while !client.ping() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let response = client.call(1);
+        assert_eq!(response.unwrap(), 2);
+    }
+
+    #[test]
     fn test_callback_with_errors_tcp() {
         let port: u16 = portpicker::pick_unused_port().unwrap();
 
@@ -559,6 +735,30 @@ mod tests {
 
         let addr = format!("127.0.0.1:{}", port).parse().unwrap();
         let client: RpcClient<i32, i32> = RpcClient::with_tcp_addr(addr);
+        while !client.ping() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let response = client.call(0);
+        let err = response.unwrap_err();
+        assert!(err.is_rpc());
+        assert!(!err.is_io());
+        let err = err.unwrap_rpc();
+        assert_eq!(err, "callback example error");
+    }
+
+    #[test]
+    fn test_callback_with_errors_unix() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let socket = tempdir.path().join("socket");
+        let socket = socket.as_path().to_str().unwrap();
+        let server: RpcServer = RpcServer::with_unix_socket::<i32, i32>(
+            "test",
+            socket,
+            Box::new(|_| Err(String::from("callback example error"))),
+        );
+        assert!(server.is_running());
+
+        let client: RpcClient<i32, i32> = RpcClient::with_unix_socket(socket);
         while !client.ping() {
             thread::sleep(Duration::from_millis(1));
         }
@@ -594,6 +794,29 @@ mod tests {
     }
 
     #[test]
+    fn test_mismatched_types_unix() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let socket = tempdir.path().join("socket");
+        let socket = socket.as_path().to_str().unwrap();
+        let server: RpcServer =
+            RpcServer::with_unix_socket::<i32, i32>("test", socket, Box::new(|x| Ok(x + 1)));
+        assert!(server.is_running());
+
+        let client: RpcClient<String, String> = RpcClient::with_unix_socket(socket);
+        while !client.ping() {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let response = client.call(String::from("hello"));
+        let err = response.unwrap_err();
+        assert!(!err.is_rpc());
+        assert!(err.is_io());
+        let err = err.to_string();
+        let re = Regex::new(r"failed to deserialize").unwrap();
+        assert!(re.is_match(&err));
+    }
+
+    #[test]
     fn test_large_data_tcp() {
         let port: u16 = portpicker::pick_unused_port().unwrap();
 
@@ -603,6 +826,31 @@ mod tests {
 
         let addr = format!("127.0.0.1:{}", port).parse().unwrap();
         let client: RpcClient<String, usize> = RpcClient::with_tcp_addr(addr);
+        while !client.ping() {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let size = BUFFER_SIZE + BUFFER_SIZE / 2;
+        let mut request = String::new();
+        while request.len() < size {
+            request += "adsfadfasdfasdfasdfasdfasdfsadf";
+        }
+        let size = request.len();
+
+        let response = client.call(request);
+        assert_eq!(response.unwrap(), size);
+    }
+
+    #[test]
+    fn test_large_data_unix() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let socket = tempdir.path().join("socket");
+        let socket = socket.as_path().to_str().unwrap();
+        let server: RpcServer =
+            RpcServer::with_unix_socket::<String, usize>("test", socket, Box::new(|x| Ok(x.len())));
+        assert!(server.is_running());
+
+        let client: RpcClient<String, usize> = RpcClient::with_unix_socket(socket);
         while !client.ping() {
             thread::sleep(Duration::from_millis(1));
         }
