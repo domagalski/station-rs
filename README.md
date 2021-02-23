@@ -1,7 +1,8 @@
 # station
 A network-based interprocess communication (IPC) library written in Rust.
 
-NOTE: this is heavily under development
+NOTE: this is heavily under development and not everything is available.
+Anything version less than v0.1.0 is incomplete.
 
 ## Structure
 
@@ -21,3 +22,13 @@ to a topic.
 * `Subscriber`: Subscribe to a topic and process messages via a callback.
 * `RpcServer`: Listen for requests and send the result back to the sender.
 * `RpcClient` Send requests to a server and wait for the response.
+
+## Status
+
+* [x] TCP RPC
+* [ ] Unix Socket RPC
+* [ ] TCP Pubsub
+* [ ] UDP Pubsub
+* [ ] Unix Socket Pubsub
+* [ ] Station/Task nodes
+* [ ] Type Configuration
