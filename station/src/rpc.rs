@@ -10,6 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use bincode;
 use byteorder::{ByteOrder, BE};
@@ -23,9 +24,21 @@ use serde::Serialize;
 // the callback type for passing closures into a new RPC handler.
 type Callback<T, U> = Box<dyn Send + Fn(T) -> Result<U, String>>;
 
-trait ReadWrite: Read + Write {}
-impl ReadWrite for TcpStream {}
-impl ReadWrite for UnixStream {}
+trait ReadWrite: Read + Write {
+    fn set_timeout(&self, timeout: Option<Duration>) -> Result<(), IoError>;
+}
+impl ReadWrite for TcpStream {
+    fn set_timeout(&self, timeout: Option<Duration>) -> Result<(), IoError> {
+        self.set_write_timeout(timeout)?;
+        self.set_read_timeout(timeout)
+    }
+}
+impl ReadWrite for UnixStream {
+    fn set_timeout(&self, timeout: Option<Duration>) -> Result<(), IoError> {
+        self.set_write_timeout(timeout)?;
+        self.set_read_timeout(timeout)
+    }
+}
 
 // size of the buffer for incoming messages
 const BUFFER_SIZE: usize = 2048;
@@ -36,6 +49,7 @@ const BUFFER_SIZE: usize = 2048;
 const PING_KEYWORD: u32 = 0xC001C0DE;
 const MESSAGE_KEYWORD: u32 = 0xC0DEFEED;
 const STOP_KEYWORD: u32 = 0xC0DEDEAD;
+const ERROR_KEYWORD: u32 = 0xC0DEEEEE;
 const HEADER_SIZE: usize = mem::size_of::<u32>() + mem::size_of::<u64>();
 
 #[derive(Clone)]
@@ -58,6 +72,10 @@ pub enum RpcError {
 }
 
 impl RpcError {
+    fn error_msg(msg: &str) -> String {
+        format!("RpcError: {}", msg)
+    }
+
     /// Return True if the `RpcError` contains an IO Error.
     pub fn is_io(&self) -> bool {
         match self {
@@ -286,8 +304,18 @@ where
     }
 
     /// Call the RPC and return the response.
-    pub fn call(&self, request: T) -> Result<U, RpcError> {
-        match self.sender.send_recv(request) {
+    pub fn call(&self, request: T, timeout: Duration) -> Result<U, RpcError> {
+        let now = Instant::now();
+        while !self.ping(timeout) {
+            thread::sleep(Duration::from_millis(1));
+            if now.elapsed() > timeout {
+                return Err(RpcError::RpcError(String::from(
+                    "RPC call timed out while waiting for ping",
+                )));
+            }
+        }
+
+        match self.sender.send_recv(request, timeout) {
             Ok(response) => Ok(response),
             Err(err) => {
                 match err.kind() {
@@ -314,20 +342,35 @@ where
     }
 
     /// Check if the corresponding RPC server is online.
-    pub fn ping(&self) -> bool {
-        self.sender.ping()
+    pub fn ping(&self, timeout: Duration) -> bool {
+        self.sender.ping(timeout)
+    }
+
+    /// Wait indefinitely for the RPC server to come online.
+    pub fn wait_for_server(&self, ping_timeout: Duration) {
+        while !self.ping(ping_timeout) {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
-fn construct_message(data: impl Serialize) -> Vec<u8> {
-    let mut response_bytes = bincode::serialize(&data).unwrap();
+fn construct_payload(data: impl Serialize, keyword: u32) -> Vec<u8> {
+    let mut message_bytes = bincode::serialize(&data).unwrap();
     let mut message: Vec<u8> = Vec::new();
     message.resize(HEADER_SIZE, 0);
     let keyword_bound = mem::size_of::<u32>();
-    BE::write_u32(&mut message[..keyword_bound], MESSAGE_KEYWORD);
-    BE::write_u64(&mut message[keyword_bound..], response_bytes.len() as u64);
-    message.append(&mut response_bytes);
+    BE::write_u32(&mut message[..keyword_bound], keyword);
+    BE::write_u64(&mut message[keyword_bound..], message_bytes.len() as u64);
+    message.append(&mut message_bytes);
     message
+}
+
+fn construct_message(data: impl Serialize) -> Vec<u8> {
+    construct_payload(data, MESSAGE_KEYWORD)
+}
+
+fn construct_error(error: &str) -> Vec<u8> {
+    construct_payload(error, ERROR_KEYWORD)
 }
 
 fn write_stream(stream: &mut impl ReadWrite, data: impl Serialize) -> Result<usize, IoError> {
@@ -335,7 +378,8 @@ fn write_stream(stream: &mut impl ReadWrite, data: impl Serialize) -> Result<usi
     stream.write(&message)
 }
 
-fn ping(stream: &mut impl ReadWrite) -> bool {
+fn ping(stream: &mut impl ReadWrite, timeout: Duration) -> bool {
+    let _ = stream.set_timeout(Some(timeout));
     let mut signal: [u8; HEADER_SIZE] = [0; HEADER_SIZE];
     BE::write_u32(&mut signal, PING_KEYWORD);
     match stream.write(&signal) {
@@ -346,15 +390,22 @@ fn ping(stream: &mut impl ReadWrite) -> bool {
         }
     }
 
-    // TODO wait for a response
+    let mut buffer: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
+    if let Ok(n_bytes) = stream.read(&mut buffer) {
+        log::trace!("ping response: {:?}", &buffer[..n_bytes]);
+    } else {
+        return false;
+    }
 
     return true;
 }
 
 fn recv<T: DeserializeOwned + Serialize>(
-    stream: &mut impl Read,
+    stream: &mut impl ReadWrite,
+    timeout: Option<Duration>,
     is_result_type: bool,
 ) -> Result<T, IoError> {
+    let _ = stream.set_timeout(timeout);
     let mut buffer: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
     let n_bytes = stream.read(&mut buffer)?;
     // there must be at least enough bytes for the stop signal
@@ -368,9 +419,14 @@ fn recv<T: DeserializeOwned + Serialize>(
     let keyword_bound = mem::size_of::<u32>();
     let keyword: u32 = BE::read_u32(&buffer[..keyword_bound]);
     let message_size: usize = match keyword {
-        PING_KEYWORD => return Err(IoError::new(ErrorKind::WriteZero, "ping")),
         MESSAGE_KEYWORD => BE::read_u64(&buffer[keyword_bound..HEADER_SIZE]) as usize,
+        PING_KEYWORD => return Err(IoError::new(ErrorKind::WriteZero, "ping")),
         STOP_KEYWORD => return Err(IoError::new(ErrorKind::Interrupted, "stop requested")),
+        ERROR_KEYWORD => {
+            let error_msg: &str = bincode::deserialize(&buffer[HEADER_SIZE..n_bytes]).unwrap();
+            let error_msg = RpcError::error_msg(error_msg);
+            return Err(IoError::new(ErrorKind::Other, error_msg));
+        }
         _ => {
             return Err(IoError::new(
                 ErrorKind::InvalidData,
@@ -417,7 +473,7 @@ fn recv<T: DeserializeOwned + Serialize>(
             Ok(resp) => Ok(resp),
             Err(err) => Err(IoError::new(
                 ErrorKind::Other,
-                format!("RpcError: {}", err.to_string()),
+                RpcError::error_msg(&err.to_string()),
             )),
         }
     } else {
@@ -450,8 +506,8 @@ where
     T: DeserializeOwned + Serialize,
     U: DeserializeOwned + Serialize,
 {
-    fn send_recv(&self, req: T) -> Result<U, IoError>;
-    fn ping(&self) -> bool;
+    fn send_recv(&self, req: T, timeout: Duration) -> Result<U, IoError>;
+    fn ping(&self, timeout: Duration) -> bool;
 }
 
 struct TcpRpcListener {
@@ -480,13 +536,13 @@ impl TcpRpcListener {
 
         let message = construct_message(data);
         let response = self.stream.borrow().as_ref().unwrap().write(&message);
-        self.stream
+        let _ = self
+            .stream
             .borrow()
             .as_ref()
             .take()
             .unwrap()
-            .shutdown(Shutdown::Both)
-            .unwrap();
+            .shutdown(Shutdown::Both);
         *self.stream.borrow_mut() = None;
         response
     }
@@ -506,13 +562,18 @@ where
         }
 
         let (mut stream, _) = self.tcp.accept()?;
-        let request = recv(&mut stream, false);
+        let request = recv(&mut stream, None, false);
         match request {
-            Ok(_) => *self.stream.borrow_mut() = Some(stream),
-            _ => (),
+            Ok(value) => {
+                *self.stream.borrow_mut() = Some(stream);
+                Ok(value)
+            }
+            Err(err) => {
+                let err_str = err.to_string();
+                let _ = stream.write(construct_error(&err_str).as_slice());
+                Err(err)
+            }
         }
-        // TODO write the error
-        request
     }
 
     fn send_response(&self, resp: Result<U, String>) -> Result<(), IoError> {
@@ -548,13 +609,13 @@ impl UnixRpcListener {
 
         let message = construct_message(data);
         let response = self.stream.borrow().as_ref().unwrap().write(&message);
-        self.stream
+        let _ = self
+            .stream
             .borrow()
             .as_ref()
             .take()
             .unwrap()
-            .shutdown(Shutdown::Both)
-            .unwrap();
+            .shutdown(Shutdown::Both);
         *self.stream.borrow_mut() = None;
         response
     }
@@ -574,13 +635,18 @@ where
         }
 
         let (mut stream, _) = self.unix.accept()?;
-        let request = recv(&mut stream, false);
+        let request = recv(&mut stream, None, false);
         match request {
-            Ok(_) => *self.stream.borrow_mut() = Some(stream),
-            _ => (),
+            Ok(value) => {
+                *self.stream.borrow_mut() = Some(stream);
+                Ok(value)
+            }
+            Err(err) => {
+                let err_str = err.to_string();
+                let _ = stream.write(construct_error(&err_str).as_slice());
+                Err(err)
+            }
         }
-        // TODO write the error
-        request
     }
 
     fn send_response(&self, resp: Result<U, String>) -> Result<(), IoError> {
@@ -606,19 +672,19 @@ where
     T: DeserializeOwned + Serialize,
     U: DeserializeOwned + Serialize,
 {
-    fn send_recv(&self, req: T) -> Result<U, IoError> {
+    fn send_recv(&self, req: T, timeout: Duration) -> Result<U, IoError> {
         let mut stream = TcpStream::connect(self.addr)?;
         write_stream(&mut stream, req)?;
-        recv(&mut stream, true)
+        recv(&mut stream, Some(timeout), true)
     }
 
-    fn ping(&self) -> bool {
+    fn ping(&self, timeout: Duration) -> bool {
         let mut stream = match TcpStream::connect(self.addr) {
             Ok(stream) => stream,
             Err(_) => return false,
         };
 
-        ping(&mut stream)
+        ping(&mut stream, timeout)
     }
 }
 
@@ -639,34 +705,49 @@ where
     T: DeserializeOwned + Serialize,
     U: DeserializeOwned + Serialize,
 {
-    fn send_recv(&self, req: T) -> Result<U, IoError> {
+    fn send_recv(&self, req: T, timeout: Duration) -> Result<U, IoError> {
         let mut stream = UnixStream::connect(&self.path)?;
         write_stream(&mut stream, req)?;
-        recv(&mut stream, true)
+        recv(&mut stream, Some(timeout), true)
     }
 
-    fn ping(&self) -> bool {
+    fn ping(&self, timeout: Duration) -> bool {
         let mut stream = match UnixStream::connect(&self.path) {
             Ok(stream) => stream,
             Err(_) => return false,
         };
 
-        ping(&mut stream)
+        ping(&mut stream, timeout)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use portpicker;
+    use serde::Deserialize;
     use tempfile;
-    use test_env_log::test;
 
     use super::*;
 
+    fn setup_logging() {
+        let _ = env_logger::builder()
+            .format(|buf, record| {
+                writeln!(
+                    buf,
+                    "{}:{} [{}] - {}",
+                    record.file().unwrap_or("unknown"),
+                    record.line().unwrap_or(0),
+                    record.level(),
+                    record.args()
+                )
+            })
+            .is_test(true)
+            .try_init();
+    }
+
     #[test]
     fn start_stop_server_tcp() {
+        setup_logging();
         let port: u16 = portpicker::pick_unused_port().unwrap();
         let mut server: RpcServer =
             RpcServer::with_tcp_port::<i32, ()>("test", port, Box::new(|_| Ok(())));
@@ -677,6 +758,7 @@ mod tests {
 
     #[test]
     fn start_stop_server_unix() {
+        setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
         let socket = socket.as_path().to_str().unwrap();
@@ -689,6 +771,7 @@ mod tests {
 
     #[test]
     fn test_client_tcp() {
+        setup_logging();
         let port: u16 = portpicker::pick_unused_port().unwrap();
 
         let server: RpcServer =
@@ -697,15 +780,14 @@ mod tests {
 
         let addr = format!("127.0.0.1:{}", port).parse().unwrap();
         let client: RpcClient<i32, i32> = RpcClient::with_tcp_addr(addr);
-        while !client.ping() {
-            thread::sleep(Duration::from_millis(1));
-        }
-        let response = client.call(1);
+        client.wait_for_server(Duration::from_millis(100));
+        let response = client.call(1, Duration::from_secs(5));
         assert_eq!(response.unwrap(), 2);
     }
 
     #[test]
     fn test_client_unix() {
+        setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
         let socket = socket.as_path().to_str().unwrap();
@@ -714,16 +796,14 @@ mod tests {
         assert!(server.is_running());
 
         let client: RpcClient<i32, i32> = RpcClient::with_unix_socket(socket);
-
-        while !client.ping() {
-            thread::sleep(Duration::from_millis(1));
-        }
-        let response = client.call(1);
+        client.wait_for_server(Duration::from_millis(100));
+        let response = client.call(1, Duration::from_secs(5));
         assert_eq!(response.unwrap(), 2);
     }
 
     #[test]
     fn test_callback_with_errors_tcp() {
+        setup_logging();
         let port: u16 = portpicker::pick_unused_port().unwrap();
 
         let server: RpcServer = RpcServer::with_tcp_port::<i32, i32>(
@@ -735,10 +815,7 @@ mod tests {
 
         let addr = format!("127.0.0.1:{}", port).parse().unwrap();
         let client: RpcClient<i32, i32> = RpcClient::with_tcp_addr(addr);
-        while !client.ping() {
-            thread::sleep(Duration::from_millis(1));
-        }
-        let response = client.call(0);
+        let response = client.call(0, Duration::from_secs(5));
         let err = response.unwrap_err();
         assert!(err.is_rpc());
         assert!(!err.is_io());
@@ -748,6 +825,7 @@ mod tests {
 
     #[test]
     fn test_callback_with_errors_unix() {
+        setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
         let socket = socket.as_path().to_str().unwrap();
@@ -759,10 +837,8 @@ mod tests {
         assert!(server.is_running());
 
         let client: RpcClient<i32, i32> = RpcClient::with_unix_socket(socket);
-        while !client.ping() {
-            thread::sleep(Duration::from_millis(1));
-        }
-        let response = client.call(0);
+        client.wait_for_server(Duration::from_millis(100));
+        let response = client.call(0, Duration::from_secs(5));
         let err = response.unwrap_err();
         assert!(err.is_rpc());
         assert!(!err.is_io());
@@ -772,6 +848,7 @@ mod tests {
 
     #[test]
     fn test_mismatched_types_tcp() {
+        setup_logging();
         let port: u16 = portpicker::pick_unused_port().unwrap();
 
         let server: RpcServer =
@@ -780,11 +857,9 @@ mod tests {
 
         let addr = format!("127.0.0.1:{}", port).parse().unwrap();
         let client: RpcClient<String, String> = RpcClient::with_tcp_addr(addr);
-        while !client.ping() {
-            thread::sleep(Duration::from_millis(1));
-        }
+        client.wait_for_server(Duration::from_millis(100));
 
-        let response = client.call(String::from("hello"));
+        let response = client.call(String::from("hello"), Duration::from_secs(5));
         let err = response.unwrap_err();
         assert!(!err.is_rpc());
         assert!(err.is_io());
@@ -795,6 +870,7 @@ mod tests {
 
     #[test]
     fn test_mismatched_types_unix() {
+        setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
         let socket = socket.as_path().to_str().unwrap();
@@ -803,11 +879,9 @@ mod tests {
         assert!(server.is_running());
 
         let client: RpcClient<String, String> = RpcClient::with_unix_socket(socket);
-        while !client.ping() {
-            thread::sleep(Duration::from_millis(1));
-        }
+        client.wait_for_server(Duration::from_millis(100));
 
-        let response = client.call(String::from("hello"));
+        let response = client.call(String::from("hello"), Duration::from_secs(5));
         let err = response.unwrap_err();
         assert!(!err.is_rpc());
         assert!(err.is_io());
@@ -817,7 +891,79 @@ mod tests {
     }
 
     #[test]
+    fn test_mismatched_struct_types_tcp() {
+        #[derive(Debug, Deserialize, Serialize)]
+        struct TwoInts {
+            num1: i32,
+            num2: i32,
+        }
+
+        #[derive(Debug, Deserialize, Serialize)]
+        struct OneInt {
+            num: i32,
+        }
+
+        setup_logging();
+        let port: u16 = portpicker::pick_unused_port().unwrap();
+
+        let server: RpcServer = RpcServer::with_tcp_port::<TwoInts, OneInt>(
+            "test",
+            port,
+            Box::new(|_| Ok(OneInt { num: 0 })),
+        );
+        assert!(server.is_running());
+
+        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let client: RpcClient<OneInt, TwoInts> = RpcClient::with_tcp_addr(addr);
+        client.wait_for_server(Duration::from_millis(100));
+
+        let response = client.call(OneInt { num: 10 }, Duration::from_secs(5));
+        let err = response.unwrap_err();
+        assert!(err.is_rpc());
+        assert!(!err.is_io());
+        let err = err.to_string();
+        log::trace!("err: {}", err);
+    }
+
+    #[test]
+    fn test_mismatched_struct_types_unix() {
+        #[derive(Debug, Deserialize, Serialize)]
+        struct TwoInts {
+            num1: i32,
+            num2: i32,
+        }
+
+        #[derive(Debug, Deserialize, Serialize)]
+        struct OneInt {
+            num: i32,
+        }
+
+        setup_logging();
+        let tempdir = tempfile::tempdir().unwrap();
+        let socket = tempdir.path().join("socket");
+        let socket = socket.as_path().to_str().unwrap();
+
+        let server: RpcServer = RpcServer::with_unix_socket::<TwoInts, OneInt>(
+            "test",
+            socket,
+            Box::new(|_| Ok(OneInt { num: 0 })),
+        );
+        assert!(server.is_running());
+
+        let client: RpcClient<OneInt, TwoInts> = RpcClient::with_unix_socket(socket);
+        client.wait_for_server(Duration::from_millis(100));
+
+        let response = client.call(OneInt { num: 10 }, Duration::from_secs(5));
+        let err = response.unwrap_err();
+        assert!(err.is_rpc());
+        assert!(!err.is_io());
+        let err = err.to_string();
+        log::trace!("err: {}", err);
+    }
+
+    #[test]
     fn test_large_data_tcp() {
+        setup_logging();
         let port: u16 = portpicker::pick_unused_port().unwrap();
 
         let server: RpcServer =
@@ -826,9 +972,6 @@ mod tests {
 
         let addr = format!("127.0.0.1:{}", port).parse().unwrap();
         let client: RpcClient<String, usize> = RpcClient::with_tcp_addr(addr);
-        while !client.ping() {
-            thread::sleep(Duration::from_millis(1));
-        }
 
         let size = BUFFER_SIZE + BUFFER_SIZE / 2;
         let mut request = String::new();
@@ -837,12 +980,13 @@ mod tests {
         }
         let size = request.len();
 
-        let response = client.call(request);
+        let response = client.call(request, Duration::from_secs(5));
         assert_eq!(response.unwrap(), size);
     }
 
     #[test]
     fn test_large_data_unix() {
+        setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
         let socket = socket.as_path().to_str().unwrap();
@@ -851,9 +995,7 @@ mod tests {
         assert!(server.is_running());
 
         let client: RpcClient<String, usize> = RpcClient::with_unix_socket(socket);
-        while !client.ping() {
-            thread::sleep(Duration::from_millis(1));
-        }
+        client.wait_for_server(Duration::from_millis(100));
 
         let size = BUFFER_SIZE + BUFFER_SIZE / 2;
         let mut request = String::new();
@@ -862,7 +1004,70 @@ mod tests {
         }
         let size = request.len();
 
-        let response = client.call(request);
+        let response = client.call(request, Duration::from_secs(5));
         assert_eq!(response.unwrap(), size);
+    }
+
+    #[test]
+    fn test_timeout_tcp() {
+        setup_logging();
+        let port: u16 = portpicker::pick_unused_port().unwrap();
+
+        let stop = Arc::new(RwLock::new(false));
+        let stop_requested = Arc::clone(&stop);
+
+        let server: RpcServer = RpcServer::with_tcp_port::<i32, i32>(
+            "test",
+            port,
+            Box::new(move |_| {
+                loop {
+                    thread::sleep(Duration::from_millis(1));
+                    if *stop_requested.read() {
+                        break;
+                    }
+                }
+                Ok(0)
+            }),
+        );
+        assert!(server.is_running());
+
+        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let client: RpcClient<i32, i32> = RpcClient::with_tcp_addr(addr);
+        let result = client.call(0, Duration::from_millis(100));
+        log::trace!("{:?}", result);
+        assert!(result.is_err());
+        *stop.write() = true;
+    }
+
+    #[test]
+    fn test_timeout_unix() {
+        setup_logging();
+        let tempdir = tempfile::tempdir().unwrap();
+        let socket = tempdir.path().join("socket");
+        let socket = socket.as_path().to_str().unwrap();
+
+        let stop = Arc::new(RwLock::new(false));
+        let stop_requested = Arc::clone(&stop);
+
+        let server: RpcServer = RpcServer::with_unix_socket::<i32, i32>(
+            "test",
+            socket,
+            Box::new(move |_| {
+                loop {
+                    thread::sleep(Duration::from_millis(1));
+                    if *stop_requested.read() {
+                        break;
+                    }
+                }
+                Ok(0)
+            }),
+        );
+        assert!(server.is_running());
+
+        let client: RpcClient<i32, i32> = RpcClient::with_unix_socket(socket);
+        let result = client.call(0, Duration::from_millis(100));
+        log::trace!("{:?}", result);
+        assert!(result.is_err());
+        *stop.write() = true;
     }
 }
