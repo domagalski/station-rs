@@ -26,7 +26,7 @@ to a topic.
 ## Status
 
 * [x] TCP RPC
-* [ ] Unix Socket RPC
+* [x] Unix Socket RPC
 * [ ] TCP Pubsub
 * [ ] UDP Pubsub
 * [ ] Unix Socket Pubsub
