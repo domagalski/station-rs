@@ -5,6 +5,8 @@
 //! request-response model. This library aims for flexibility in the networking protocol used to
 //! transmit messages.
 
+pub(crate) mod net;
+
 //pub mod process;
 //pub mod pubsub;
 pub mod rpc;

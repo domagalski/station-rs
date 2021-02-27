@@ -1,9 +1,7 @@
-use std::any;
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt::{Debug, Display, Error as FmtError, Formatter};
-use std::io::{Error as IoError, ErrorKind, Read, Write};
-use std::mem;
+use std::io::{Error as IoError, ErrorKind, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::ops::Drop;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -12,8 +10,6 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use bincode;
-use byteorder::{ByteOrder, BE};
 use lazy_static;
 use log;
 use parking_lot::RwLock;
@@ -21,36 +17,10 @@ use regex::Regex;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::net;
+
 // the callback type for passing closures into a new RPC handler.
 type Callback<T, U> = Box<dyn Send + Fn(T) -> Result<U, String>>;
-
-trait ReadWrite: Read + Write {
-    fn set_timeout(&self, timeout: Option<Duration>) -> Result<(), IoError>;
-}
-impl ReadWrite for TcpStream {
-    fn set_timeout(&self, timeout: Option<Duration>) -> Result<(), IoError> {
-        self.set_write_timeout(timeout)?;
-        self.set_read_timeout(timeout)
-    }
-}
-impl ReadWrite for UnixStream {
-    fn set_timeout(&self, timeout: Option<Duration>) -> Result<(), IoError> {
-        self.set_write_timeout(timeout)?;
-        self.set_read_timeout(timeout)
-    }
-}
-
-// size of the buffer for incoming messages
-const BUFFER_SIZE: usize = 2048;
-// Incoming messages may be of multiple purposes, sometimes to encode a message and other times to
-// tell a listening thread to shut down. All incoming messages should be prepended with a u32 with
-// the message type (message or stop) and a u64 containing the message size, excluding the header
-// size. The message type and size parameter are both expected to be encoded as big endian.
-const PING_KEYWORD: u32 = 0xC001C0DE;
-const MESSAGE_KEYWORD: u32 = 0xC0DEFEED;
-const STOP_KEYWORD: u32 = 0xC0DEDEAD;
-const ERROR_KEYWORD: u32 = 0xC0DEEEEE;
-const HEADER_SIZE: usize = mem::size_of::<u32>() + mem::size_of::<u64>();
 
 #[derive(Clone)]
 enum ListenPort {
@@ -71,11 +41,8 @@ pub enum RpcError {
     RpcError(String),
 }
 
+const RPC_ERROR: &str = "RpcError";
 impl RpcError {
-    fn error_msg(msg: &str) -> String {
-        format!("RpcError: {}", msg)
-    }
-
     /// Return True if the `RpcError` contains an IO Error.
     pub fn is_io(&self) -> bool {
         match self {
@@ -110,6 +77,7 @@ impl RpcError {
 }
 
 impl Display for RpcError {
+    /// Display the RPC Error.
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(f, "{:?}", self)
     }
@@ -226,45 +194,21 @@ impl RpcServer {
     }
 
     fn send_stop_signal(&self) {
-        let mut signal: [u8; HEADER_SIZE] = [0; HEADER_SIZE];
-        BE::write_u32(&mut signal, STOP_KEYWORD);
-
         match &self.listen_port {
-            ListenPort::TcpPort(port) => self.send_stop_signal_tcp(*port, &signal),
-            ListenPort::Unix(path) => self.send_stop_signal_unix(&path, &signal),
+            ListenPort::TcpPort(port) => self.send_stop_signal_tcp(*port),
+            ListenPort::Unix(path) => self.send_stop_signal_unix(&path),
         }
     }
 
-    fn send_stop_signal_tcp(&self, port: u16, signal: &[u8]) {
-        let stream = TcpStream::connect(format!("127.0.0.1:{}", port));
-        // the only reason why the TCP endpoint shouldn't connect is that the thread has already
-        // been shut down, in which case, not being able to connect to tell it to shut down is fine
-        if let Ok(mut stream) = stream {
-            match stream.write(signal) {
-                Ok(size) => log::trace!(
-                    "{}: wrote stop requested signal of {} bytes",
-                    self.name,
-                    size
-                ),
-                Err(err) => log::trace!("{}: stop request had error: {}", self.name, err),
-            }
-        }
+    fn send_stop_signal_tcp(&self, port: u16) {
+        net::write_stop_signal(
+            TcpStream::connect(format!("127.0.0.1:{}", port)),
+            &self.name,
+        );
     }
 
-    fn send_stop_signal_unix(&self, path: &str, signal: &[u8]) {
-        let stream = UnixStream::connect(path);
-        // the only reason why the Unix endpoint shouldn't connect is that the thread has already
-        // been shut down, in which case, not being able to connect to tell it to shut down is fine
-        if let Ok(mut stream) = stream {
-            match stream.write(signal) {
-                Ok(size) => log::trace!(
-                    "{}: wrote stop requested signal of {} bytes",
-                    self.name,
-                    size
-                ),
-                Err(err) => log::trace!("{}: stop request had error: {}", self.name, err),
-            }
-        }
+    fn send_stop_signal_unix(&self, path: &str) {
+        net::write_stop_signal(UnixStream::connect(path), &self.name);
     }
 }
 
@@ -276,6 +220,9 @@ impl Drop for RpcServer {
 }
 
 /// The RPC client sends data of type `T` to a server and expects a response of type `U`.
+///
+/// It is extremely important that the types on the client and server match, else the RPC calls will
+/// likely fail.
 pub struct RpcClient<T, U> {
     sender: Box<dyn RpcSender<T, U>>,
 }
@@ -304,6 +251,11 @@ where
     }
 
     /// Call the RPC and return the response.
+    ///
+    /// If the types used to initialize the RPC client differ from the RPC server, some very
+    /// cryptic errors can occur. Since `bincode` is used for serialization, the type of error can
+    /// differ depending on where the deserialization occurs. In any case, it's important to make
+    /// sure types are matched properly when creating RPC servers and clients.
     pub fn call(&self, request: T, timeout: Duration) -> Result<U, RpcError> {
         let now = Instant::now();
         while !self.ping(timeout) {
@@ -322,7 +274,7 @@ where
                     ErrorKind::Other => {
                         let err_str = err.to_string();
                         lazy_static::lazy_static! {
-                            static ref RE: Regex = Regex::new(r"RpcError: ").unwrap();
+                            static ref RE: Regex = Regex::new(&format!("{}: ", RPC_ERROR)).unwrap();
                         }
 
                         if RE.is_match(&err_str) {
@@ -350,143 +302,6 @@ where
     pub fn wait_for_server(&self, ping_timeout: Duration) {
         while !self.ping(ping_timeout) {
             thread::sleep(Duration::from_millis(1));
-        }
-    }
-}
-
-fn construct_payload(data: impl Serialize, keyword: u32) -> Vec<u8> {
-    let mut message_bytes = bincode::serialize(&data).unwrap();
-    let mut message: Vec<u8> = Vec::new();
-    message.resize(HEADER_SIZE, 0);
-    let keyword_bound = mem::size_of::<u32>();
-    BE::write_u32(&mut message[..keyword_bound], keyword);
-    BE::write_u64(&mut message[keyword_bound..], message_bytes.len() as u64);
-    message.append(&mut message_bytes);
-    message
-}
-
-fn construct_message(data: impl Serialize) -> Vec<u8> {
-    construct_payload(data, MESSAGE_KEYWORD)
-}
-
-fn construct_error(error: &str) -> Vec<u8> {
-    construct_payload(error, ERROR_KEYWORD)
-}
-
-fn write_stream(stream: &mut impl ReadWrite, data: impl Serialize) -> Result<usize, IoError> {
-    let message = construct_message(data);
-    stream.write(&message)
-}
-
-fn ping(stream: &mut impl ReadWrite, timeout: Duration) -> bool {
-    let _ = stream.set_timeout(Some(timeout));
-    let mut signal: [u8; HEADER_SIZE] = [0; HEADER_SIZE];
-    BE::write_u32(&mut signal, PING_KEYWORD);
-    match stream.write(&signal) {
-        Ok(size) => log::trace!("wrote ping requested signal of {} bytes", size),
-        Err(err) => {
-            log::trace!("ping request had error: {}", err);
-            return false;
-        }
-    }
-
-    let mut buffer: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
-    if let Ok(n_bytes) = stream.read(&mut buffer) {
-        log::trace!("ping response: {:?}", &buffer[..n_bytes]);
-    } else {
-        return false;
-    }
-
-    return true;
-}
-
-fn recv<T: DeserializeOwned + Serialize>(
-    stream: &mut impl ReadWrite,
-    timeout: Option<Duration>,
-    is_result_type: bool,
-) -> Result<T, IoError> {
-    let _ = stream.set_timeout(timeout);
-    let mut buffer: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
-    let n_bytes = stream.read(&mut buffer)?;
-    // there must be at least enough bytes for the stop signal
-    if n_bytes < HEADER_SIZE {
-        return Err(IoError::new(
-            ErrorKind::InvalidData,
-            "request message too small",
-        ));
-    }
-
-    let keyword_bound = mem::size_of::<u32>();
-    let keyword: u32 = BE::read_u32(&buffer[..keyword_bound]);
-    let message_size: usize = match keyword {
-        MESSAGE_KEYWORD => BE::read_u64(&buffer[keyword_bound..HEADER_SIZE]) as usize,
-        PING_KEYWORD => return Err(IoError::new(ErrorKind::WriteZero, "ping")),
-        STOP_KEYWORD => return Err(IoError::new(ErrorKind::Interrupted, "stop requested")),
-        ERROR_KEYWORD => {
-            let error_msg: &str = bincode::deserialize(&buffer[HEADER_SIZE..n_bytes]).unwrap();
-            let error_msg = RpcError::error_msg(error_msg);
-            return Err(IoError::new(ErrorKind::Other, error_msg));
-        }
-        _ => {
-            return Err(IoError::new(
-                ErrorKind::InvalidData,
-                format!("unknown message type: {}", keyword),
-            ))
-        }
-    };
-
-    let buffer = &buffer[..n_bytes];
-    let mut message_bytes = buffer[HEADER_SIZE..].to_vec();
-    if message_size + HEADER_SIZE <= BUFFER_SIZE && message_bytes.len() != message_size {
-        let mismatch_error = "request bytes mismatch header length";
-        return Err(IoError::new(ErrorKind::InvalidData, mismatch_error));
-    }
-
-    while message_size != message_bytes.len() {
-        let mut buffer: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
-        let n_bytes = stream.read(&mut buffer)?;
-        if n_bytes < BUFFER_SIZE && message_bytes.len() + n_bytes != message_size {
-            let mismatch_error = "bytes mismatch header length after secondary fetch";
-            return Err(IoError::new(ErrorKind::InvalidData, mismatch_error));
-        }
-
-        let buffer = &buffer[..n_bytes];
-        message_bytes.append(&mut buffer.to_vec());
-    }
-
-    if is_result_type {
-        let response: Result<T, String> = match bincode::deserialize(&message_bytes) {
-            Ok(resp) => resp,
-            Err(_) => {
-                let err_str = format!(
-                    "failed to deserialize to {}",
-                    any::type_name::<Result<T, String>>()
-                );
-                return Err(IoError::new(
-                    ErrorKind::InvalidInput,
-                    format!("{}", err_str),
-                ));
-            }
-        };
-
-        match response {
-            Ok(resp) => Ok(resp),
-            Err(err) => Err(IoError::new(
-                ErrorKind::Other,
-                RpcError::error_msg(&err.to_string()),
-            )),
-        }
-    } else {
-        let message_bytes = message_bytes.as_slice();
-        match bincode::deserialize(&message_bytes) {
-            Ok(message) => Ok(message),
-            Err(_) => {
-                let err_str = format!("failed to deserialize to {}", any::type_name::<T>());
-                Err(IoError::new(
-                    ErrorKind::InvalidInput,
-                    format!("{}", err_str),
-                ))
-            }
         }
     }
 }
@@ -534,7 +349,7 @@ impl TcpRpcListener {
             ));
         }
 
-        let message = construct_message(data);
+        let message = net::construct_message(data);
         let response = self.stream.borrow().as_ref().unwrap().write(&message);
         let _ = self
             .stream
@@ -562,7 +377,7 @@ where
         }
 
         let (mut stream, _) = self.tcp.accept()?;
-        let request = recv(&mut stream, None, false);
+        let request = net::recv(&mut stream, None, RPC_ERROR, false);
         match request {
             Ok(value) => {
                 *self.stream.borrow_mut() = Some(stream);
@@ -570,7 +385,7 @@ where
             }
             Err(err) => {
                 let err_str = err.to_string();
-                let _ = stream.write(construct_error(&err_str).as_slice());
+                let _ = stream.write(net::construct_error(&err_str).as_slice());
                 Err(err)
             }
         }
@@ -607,7 +422,7 @@ impl UnixRpcListener {
             ));
         }
 
-        let message = construct_message(data);
+        let message = net::construct_message(data);
         let response = self.stream.borrow().as_ref().unwrap().write(&message);
         let _ = self
             .stream
@@ -635,7 +450,7 @@ where
         }
 
         let (mut stream, _) = self.unix.accept()?;
-        let request = recv(&mut stream, None, false);
+        let request = net::recv(&mut stream, None, RPC_ERROR, false);
         match request {
             Ok(value) => {
                 *self.stream.borrow_mut() = Some(stream);
@@ -643,7 +458,7 @@ where
             }
             Err(err) => {
                 let err_str = err.to_string();
-                let _ = stream.write(construct_error(&err_str).as_slice());
+                let _ = stream.write(net::construct_error(&err_str).as_slice());
                 Err(err)
             }
         }
@@ -674,8 +489,8 @@ where
 {
     fn send_recv(&self, req: T, timeout: Duration) -> Result<U, IoError> {
         let mut stream = TcpStream::connect(self.addr)?;
-        write_stream(&mut stream, req)?;
-        recv(&mut stream, Some(timeout), true)
+        net::write_socket(&mut stream, req)?;
+        net::recv(&mut stream, Some(timeout), RPC_ERROR, true)
     }
 
     fn ping(&self, timeout: Duration) -> bool {
@@ -684,7 +499,7 @@ where
             Err(_) => return false,
         };
 
-        ping(&mut stream, timeout)
+        net::ping(&mut stream, timeout)
     }
 }
 
@@ -707,8 +522,8 @@ where
 {
     fn send_recv(&self, req: T, timeout: Duration) -> Result<U, IoError> {
         let mut stream = UnixStream::connect(&self.path)?;
-        write_stream(&mut stream, req)?;
-        recv(&mut stream, Some(timeout), true)
+        net::write_socket(&mut stream, req)?;
+        net::recv(&mut stream, Some(timeout), RPC_ERROR, true)
     }
 
     fn ping(&self, timeout: Duration) -> bool {
@@ -717,7 +532,7 @@ where
             Err(_) => return false,
         };
 
-        ping(&mut stream, timeout)
+        net::ping(&mut stream, timeout)
     }
 }
 
@@ -973,7 +788,7 @@ mod tests {
         let addr = format!("127.0.0.1:{}", port).parse().unwrap();
         let client: RpcClient<String, usize> = RpcClient::with_tcp_addr(addr);
 
-        let size = BUFFER_SIZE + BUFFER_SIZE / 2;
+        let size = 5000;
         let mut request = String::new();
         while request.len() < size {
             request += "adsfadfasdfasdfasdfasdfasdfsadf";
@@ -997,7 +812,7 @@ mod tests {
         let client: RpcClient<String, usize> = RpcClient::with_unix_socket(socket);
         client.wait_for_server(Duration::from_millis(100));
 
-        let size = BUFFER_SIZE + BUFFER_SIZE / 2;
+        let size = 5000;
         let mut request = String::new();
         while request.len() < size {
             request += "adsfadfasdfasdfasdfasdfasdfsadf";
