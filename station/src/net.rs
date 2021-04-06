@@ -1,8 +1,8 @@
 use std::any;
 use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::mem;
-use std::net::TcpStream;
-use std::os::unix::net::UnixStream;
+use std::net::{SocketAddrV4, TcpStream, UdpSocket};
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::time::Duration;
 
 use bincode;
@@ -10,6 +10,73 @@ use byteorder::{ByteOrder, BE};
 use log;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+
+// newtype for UDP socket so Read/Write can be implemented
+pub struct Udp(UdpSocket, SocketAddrV4);
+
+impl Udp {
+    pub fn new(udp: UdpSocket) -> Udp {
+        Udp(udp, "0.0.0.0:0".parse().unwrap())
+    }
+
+    pub fn set_write_addr(&mut self, addr: SocketAddrV4) {
+        self.1 = addr;
+    }
+}
+
+impl Read for Udp {
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, IoError> {
+        let (n_bytes, _) = self.0.recv_from(buffer)?;
+        Ok(n_bytes)
+    }
+}
+
+impl Write for Udp {
+    fn write(&mut self, buffer: &[u8]) -> Result<usize, IoError> {
+        self.0.send_to(buffer, self.1)
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        log::warn!("UDP flush is a no-op");
+        Ok(())
+    }
+}
+
+pub struct UnixUdp(UnixDatagram, String);
+
+impl UnixUdp {
+    pub fn new(socket: UnixDatagram) -> UnixUdp {
+        UnixUdp(socket, String::new())
+    }
+
+    pub fn set_path(&mut self, path: &str) {
+        self.1 = String::from(path);
+    }
+}
+
+impl Read for UnixUdp {
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, IoError> {
+        self.0.recv(buffer)
+    }
+}
+
+impl Write for UnixUdp {
+    fn write(&mut self, buffer: &[u8]) -> Result<usize, IoError> {
+        if self.1.len() == 0 {
+            return Err(IoError::new(
+                ErrorKind::NotFound,
+                "Unix datagram path not set",
+            ));
+        }
+
+        self.0.send_to(buffer, &self.1)
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        log::warn!("Unix Datagram flush is a no-op");
+        Ok(())
+    }
+}
 
 // Trait for grouping together socket operations
 pub trait Socket: Read + Write {
@@ -27,6 +94,20 @@ impl Socket for UnixStream {
     fn set_timeout(&self, timeout: Option<Duration>) -> Result<(), IoError> {
         self.set_write_timeout(timeout)?;
         self.set_read_timeout(timeout)
+    }
+}
+
+impl Socket for Udp {
+    fn set_timeout(&self, timeout: Option<Duration>) -> Result<(), IoError> {
+        self.0.set_write_timeout(timeout)?;
+        self.0.set_read_timeout(timeout)
+    }
+}
+
+impl Socket for UnixUdp {
+    fn set_timeout(&self, timeout: Option<Duration>) -> Result<(), IoError> {
+        self.0.set_write_timeout(timeout)?;
+        self.0.set_read_timeout(timeout)
     }
 }
 
@@ -110,8 +191,8 @@ pub fn ping(socket: &mut impl Socket, timeout: Duration) -> bool {
     return true;
 }
 
-pub fn recv<T: DeserializeOwned + Serialize>(
-    socket: &mut impl Socket,
+pub fn recv<S: Socket, T: DeserializeOwned + Serialize>(
+    socket: &mut S,
     timeout: Option<Duration>,
     error_keyword: &str,
     is_result_type: bool,

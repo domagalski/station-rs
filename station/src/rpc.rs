@@ -150,7 +150,7 @@ impl RpcServer {
     ///
     /// Args:
     /// * `name`: A name to refer to the RPC server.
-    /// * `port`: The TCP port to bind the server to
+    /// * `port`: The TCP port to bind the server to.
     /// * `callback`: The function to call on incoming data.
     pub fn with_tcp_port<T, U>(name: &'static str, port: u16, callback: Callback<T, U>) -> RpcServer
     where
@@ -164,7 +164,7 @@ impl RpcServer {
     ///
     /// Args:
     /// * `name`: A name to refer to the RPC server.
-    /// * `path`: The unix socket path to bind the server to
+    /// * `path`: The unix socket path to bind the server to.
     /// * `callback`: The function to call on incoming data.
     pub fn with_unix_socket<T, U>(
         name: &'static str,
