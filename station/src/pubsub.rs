@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Error as IoError;
 use std::mem;
@@ -50,7 +51,15 @@ where
 /// The Publisher publishes messages of type `T` to its subscribers.
 pub struct Publisher<T> {
     name: String,
-    handlers: Vec<Box<dyn PublishHandler<T>>>,
+    handlers: HashMap<String, Box<dyn PublishHandler<T>>>,
+}
+
+fn sockaddr_string(addr: SocketAddr) -> String {
+    format!("{}", addr)
+}
+
+fn path_string(path: &Path) -> String {
+    format!("{}", path.to_str().unwrap_or(""))
 }
 
 impl<T> Publisher<T>
@@ -64,7 +73,7 @@ where
     pub fn new(name: &str) -> Publisher<T> {
         Publisher {
             name: String::from(name),
-            handlers: Vec::new(),
+            handlers: HashMap::new(),
         }
     }
 
@@ -75,7 +84,7 @@ where
     ///
     pub fn publish(&mut self, message: &T) {
         let tmp = mem::take(&mut self.handlers);
-        for handler in tmp.into_iter() {
+        for (key, handler) in tmp.into_iter() {
             if let Err(err) = handler.send(message) {
                 log::error!(
                     "Failed to publish to '{}' publisher {} with error: {}",
@@ -84,7 +93,7 @@ where
                     err
                 );
             } else {
-                self.handlers.push(handler);
+                assert!(self.handlers.insert(key, handler).is_none());
             }
         }
     }
@@ -93,31 +102,40 @@ where
     ///
     /// Args:
     /// * `addr`: The address of the UDP endpoint.
-    pub fn add_udp_endpoint(&mut self, addr: SocketAddr) {
-        for handler in self.handlers.iter() {
-            if let Some(socket_addr) = handler.udp() {
-                if addr == socket_addr {
-                    return;
-                }
-            }
+    pub fn add_udp_endpoint(&mut self, addr: SocketAddr) -> bool {
+        let addr_str = sockaddr_string(addr);
+        if self.handlers.contains_key(&addr_str) {
+            log::warn!(
+                "Pubsub handler for UDP endpoint already exists: {}",
+                addr_str
+            );
+            return false;
         }
-        self.handlers.push(Box::new(UdpPublisher { addr }));
+        assert!(self
+            .handlers
+            .insert(addr_str, Box::new(UdpPublisher { addr }))
+            .is_none());
+        true
     }
 
     /// Add a Unix Datagram endpoint to publish to.
     ///
     /// Args:
     /// * `path`: The Unix socket path to publish to.
-    pub fn add_unix_datagram_endpoint(&mut self, path: &Path) {
-        for handler in self.handlers.iter() {
-            if let Some(socket_addr) = handler.unix_datagram() {
-                if path == socket_addr {
-                    return;
-                }
-            }
+    pub fn add_unix_datagram_endpoint(&mut self, path: &Path) -> bool {
+        let addr_str = path_string(path);
+        if self.handlers.contains_key(&addr_str) {
+            log::warn!(
+                "Pubsub handler for Unix datagram endpoint already exists: {}",
+                addr_str
+            );
+            return false;
         }
-        self.handlers
-            .push(Box::new(UnixDatagramPublisher::new(path)));
+        assert!(self
+            .handlers
+            .insert(addr_str, Box::new(UnixDatagramPublisher::new(path)))
+            .is_none());
+        true
     }
 
     /// Return the total number of Publish endpoints.
@@ -466,7 +484,7 @@ mod tests {
                 *data = msg.clone();
             }),
         );
-        publisher.add_udp_endpoint(format!("127.0.0.1:{}", udp_port).parse().unwrap());
+        assert!(publisher.add_udp_endpoint(format!("127.0.0.1:{}", udp_port).parse().unwrap()));
         assert!(udp_subscriber.is_running());
 
         let unix_dgram_sub_msg = Arc::new(Mutex::new(null_message.clone()));
@@ -482,7 +500,7 @@ mod tests {
                 *data = msg.clone();
             }),
         );
-        publisher.add_unix_datagram_endpoint(&socket);
+        assert!(publisher.add_unix_datagram_endpoint(&socket));
         assert!(unix_subsciber.is_running());
 
         let n_subscribers = 2;
@@ -491,7 +509,6 @@ mod tests {
         let timeout = Duration::from_secs(5);
         while start.elapsed() < timeout {
             publisher.publish(&test_message);
-            thread::sleep(Duration::from_millis(10));
 
             let udp_data = udp_sub_msg.lock();
             let unix_dgram_data = unix_dgram_sub_msg.lock();
@@ -501,15 +518,132 @@ mod tests {
             if publisher.num_endpoints() != n_subscribers {
                 break;
             }
+
+            thread::sleep(Duration::from_millis(10));
         }
         let timed_out = start.elapsed() >= timeout;
         udp_subscriber.stop();
         unix_subsciber.stop();
 
-        assert!(!timed_out);
         assert_eq!(publisher.num_endpoints(), n_subscribers);
+        assert!(!timed_out);
 
         assert!(!udp_subscriber.is_running());
         assert!(!unix_subsciber.is_running());
+    }
+
+    #[test]
+    fn many_publishers_one_subscriber_udp() {
+        let mut publisher = Publisher::new("test");
+        let capture = Arc::new(Mutex::new(HashMap::new()));
+        let cb_capture_a = Arc::clone(&capture);
+        let cb_capture_b = Arc::clone(&capture);
+
+        let udp_port_a: u16 = portpicker::pick_unused_port().unwrap();
+        let udp_subscriber_a: Subscriber = Subscriber::with_udp_port::<u32>(
+            "test",
+            udp_port_a,
+            Box::new(move |msg| {
+                let mut data = cb_capture_a.lock();
+                data.insert(0, msg);
+            }),
+        );
+        assert!(publisher.add_udp_endpoint(format!("127.0.0.1:{}", udp_port_a).parse().unwrap()));
+
+        let udp_port_b: u16 = portpicker::pick_unused_port().unwrap();
+        let udp_subscriber_b: Subscriber = Subscriber::with_udp_port::<u32>(
+            "test",
+            udp_port_b,
+            Box::new(move |msg| {
+                let mut data = cb_capture_b.lock();
+                data.insert(1, msg);
+            }),
+        );
+        assert!(publisher.add_udp_endpoint(format!("127.0.0.1:{}", udp_port_b).parse().unwrap()));
+
+        assert!(udp_subscriber_a.is_running());
+        assert!(udp_subscriber_b.is_running());
+        let num_endpoints = publisher.num_endpoints();
+
+        let start = Instant::now();
+        let timeout = Duration::from_secs(5);
+        while start.elapsed() < timeout {
+            publisher.publish(&0);
+            if capture.lock().len() >= num_endpoints {
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(capture.lock().len() == num_endpoints);
+        assert!(start.elapsed() < timeout);
+    }
+
+    #[test]
+    fn many_publishers_one_subscriber_unix_datagram() {
+        let mut publisher = Publisher::new("test");
+        let capture = Arc::new(Mutex::new(HashMap::new()));
+        let cb_capture_a = Arc::clone(&capture);
+        let cb_capture_b = Arc::clone(&capture);
+
+        let tempdir_a = tempfile::tempdir().unwrap();
+        let socket_a = tempdir_a.path().join("socket");
+        let unix_subscriber_a: Subscriber = Subscriber::with_unix_datagram::<u32>(
+            "test",
+            &socket_a,
+            Box::new(move |msg| {
+                let mut data = cb_capture_a.lock();
+                data.insert(0, msg);
+            }),
+        );
+        assert!(publisher.add_unix_datagram_endpoint(&socket_a));
+
+        let tempdir_b = tempfile::tempdir().unwrap();
+        let socket_b = tempdir_b.path().join("socket");
+        let unix_subscriber_b: Subscriber = Subscriber::with_unix_datagram::<u32>(
+            "test",
+            &socket_b,
+            Box::new(move |msg| {
+                let mut data = cb_capture_b.lock();
+                data.insert(1, msg);
+            }),
+        );
+        assert!(publisher.add_unix_datagram_endpoint(&socket_b));
+
+        assert!(unix_subscriber_a.is_running());
+        assert!(unix_subscriber_b.is_running());
+        let num_endpoints = publisher.num_endpoints();
+        assert_eq!(num_endpoints, 2);
+
+        let start = Instant::now();
+        let timeout = Duration::from_secs(5);
+        while start.elapsed() < timeout {
+            publisher.publish(&0);
+            if capture.lock().len() >= num_endpoints {
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(capture.lock().len() == num_endpoints);
+        assert!(start.elapsed() < timeout);
+    }
+
+    #[test]
+    fn no_duplicate_publishers() {
+        let mut publisher: Publisher<u32> = Publisher::new("test");
+
+        let udp_port: u16 = portpicker::pick_unused_port().unwrap();
+        assert!(publisher.add_udp_endpoint(format!("127.0.0.1:{}", udp_port).parse().unwrap()));
+        assert!(!publisher.add_udp_endpoint(format!("127.0.0.1:{}", udp_port).parse().unwrap()));
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let socket = tempdir.path().join("socket");
+        assert!(publisher.add_unix_datagram_endpoint(&socket));
+        assert!(!publisher.add_unix_datagram_endpoint(&socket));
+
+        assert_eq!(publisher.num_endpoints(), 2);
     }
 }
