@@ -26,9 +26,10 @@ to a topic.
 ## Status
 
 * [x] TCP RPC
-* [x] Unix Socket RPC
-* [ ] TCP Pubsub
-* [ ] UDP Pubsub
-* [ ] Unix Socket Pubsub
+* [x] Unix Stream Socket RPC
+* [x] UDP Pubsub
+* [x] Unix Datagram Socket Pubsub
 * [ ] Station/Task nodes
 * [ ] Type Configuration
+
+I may or may not add a TCP and Unix Stream pubsub mechanism.
