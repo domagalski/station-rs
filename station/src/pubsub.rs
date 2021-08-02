@@ -4,7 +4,7 @@ use std::io::Error as IoError;
 use std::mem;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::net::UnixDatagram;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -21,7 +21,7 @@ type Callback<T> = Box<dyn Send + Fn(T)>;
 #[derive(Clone)]
 enum SubscriberPort {
     UdpPort(u16),
-    UnixDatagram(String),
+    UnixDatagram(PathBuf),
 }
 
 const PUBSUB_ERROR: &str = "PubSubError";
@@ -41,7 +41,7 @@ where
     }
 
     // return the path of the Unix socket
-    fn unix_datagram(&self) -> Option<String> {
+    fn unix_datagram(&self) -> Option<PathBuf> {
         None
     }
 }
@@ -108,7 +108,7 @@ where
     ///
     /// Args:
     /// * `path`: The Unix socket path to publish to.
-    pub fn add_unix_datagram_endpoint(&mut self, path: &str) {
+    pub fn add_unix_datagram_endpoint(&mut self, path: &Path) {
         for handler in self.handlers.iter() {
             if let Some(socket_addr) = handler.unix_datagram() {
                 if path == socket_addr {
@@ -116,9 +116,8 @@ where
                 }
             }
         }
-        self.handlers.push(Box::new(UnixDatagramPublisher {
-            path: String::from(path),
-        }));
+        self.handlers
+            .push(Box::new(UnixDatagramPublisher::new(path)));
     }
 
     /// Return the total number of Publish endpoints.
@@ -152,7 +151,20 @@ where
 }
 
 struct UnixDatagramPublisher {
-    path: String,
+    path: PathBuf,
+    socket: UnixDatagram,
+    path_seen: RefCell<bool>,
+}
+
+impl UnixDatagramPublisher {
+    fn new(path: &Path) -> UnixDatagramPublisher {
+        let socket = UnixDatagram::unbound().unwrap();
+        UnixDatagramPublisher {
+            path: PathBuf::from(path),
+            socket,
+            path_seen: RefCell::new(false),
+        }
+    }
 }
 
 impl<T> PublishHandler<T> for UnixDatagramPublisher
@@ -165,19 +177,19 @@ where
 
     fn send(&self, message: &T) -> Result<usize, IoError> {
         // sometimes the subscriber endpoint is slow to show up. don't treat it as an error to send
-        // when the endpoint doesn't exist yet.
-        // TODO make it an error
-        if !Path::new(&self.path).exists() {
+        // when the endpoint doesn't exist yet. That said, if the endpoint did exist, assume it
+        // always does exist until there's a fatal OS error writing to it.
+        if !(self.path.exists() || *self.path_seen.borrow()) {
             return Ok(0);
+        } else if self.path.exists() && !*self.path_seen.borrow() {
+            *self.path_seen.borrow_mut() = true;
         }
 
-        // TODO bring this into a new() function
-        let socket = UnixDatagram::unbound().unwrap();
         let msg_bytes = net::construct_message(message);
-        socket.send_to(&msg_bytes, &self.path)
+        self.socket.send_to(&msg_bytes, &self.path)
     }
 
-    fn unix_datagram(&self) -> Option<String> {
+    fn unix_datagram(&self) -> Option<PathBuf> {
         Some(self.path.clone())
     }
 }
@@ -249,7 +261,7 @@ impl Subscriber {
     /// * `callback`: The function to call on incoming data.
     pub fn with_unix_datagram<T>(
         name: &'static str,
-        path: &str,
+        path: &Path,
         callback: Callback<T>,
     ) -> Subscriber
     where
@@ -257,7 +269,7 @@ impl Subscriber {
     {
         Subscriber::new(
             name,
-            SubscriberPort::UnixDatagram(String::from(path)),
+            SubscriberPort::UnixDatagram(PathBuf::from(path)),
             callback,
         )
     }
@@ -291,7 +303,7 @@ impl Subscriber {
         net::write_stop_signal(Ok(udp), &self.name);
     }
 
-    fn send_stop_signal_unix(&self, path: &str) {
+    fn send_stop_signal_unix(&self, path: &Path) {
         let mut unix = UnixUdp::new(UnixDatagram::unbound().unwrap());
         unix.set_path(path);
         net::write_stop_signal(Ok(unix), &self.name);
@@ -410,9 +422,8 @@ mod tests {
         setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
-        let socket = socket.as_path().to_str().unwrap();
         let mut subscriber: Subscriber =
-            Subscriber::with_unix_datagram::<i32>("test", socket, Box::new(|_| {}));
+            Subscriber::with_unix_datagram::<i32>("test", &socket, Box::new(|_| {}));
         assert!(subscriber.is_running());
         subscriber.stop();
         assert!(!subscriber.is_running());
@@ -462,32 +473,22 @@ mod tests {
         let unix_dgram_msg_clone = Arc::clone(&unix_dgram_sub_msg);
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
-        let socket = socket.as_path().to_str().unwrap();
+        //let socket = socket.as_path().to_str().unwrap();
         let mut unix_subsciber = Subscriber::with_unix_datagram::<TestMessage>(
             "test",
-            socket,
+            &socket,
             Box::new(move |msg| {
                 let mut data = unix_dgram_msg_clone.lock();
                 *data = msg.clone();
             }),
         );
-        publisher.add_unix_datagram_endpoint(socket);
+        publisher.add_unix_datagram_endpoint(&socket);
         assert!(unix_subsciber.is_running());
-
-        // TODO(rdomagalski) make this reliable
-        let start = Instant::now();
-        let timeout = Duration::from_secs(5);
-        while start.elapsed() < timeout {
-            if Path::new(socket).exists() {
-                break;
-            } else {
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
 
         let n_subscribers = 2;
 
         let start = Instant::now();
+        let timeout = Duration::from_secs(5);
         while start.elapsed() < timeout {
             publisher.publish(&test_message);
             thread::sleep(Duration::from_millis(10));

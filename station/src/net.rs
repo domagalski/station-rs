@@ -3,6 +3,7 @@ use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::mem;
 use std::net::{SocketAddrV4, TcpStream, UdpSocket};
 use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bincode;
@@ -42,15 +43,15 @@ impl Write for Udp {
     }
 }
 
-pub struct UnixUdp(UnixDatagram, String);
+pub struct UnixUdp(UnixDatagram, PathBuf);
 
 impl UnixUdp {
     pub fn new(socket: UnixDatagram) -> UnixUdp {
-        UnixUdp(socket, String::new())
+        UnixUdp(socket, PathBuf::new())
     }
 
-    pub fn set_path(&mut self, path: &str) {
-        self.1 = String::from(path);
+    pub fn set_path(&mut self, path: &Path) {
+        self.1 = PathBuf::from(path);
     }
 }
 
@@ -62,10 +63,10 @@ impl Read for UnixUdp {
 
 impl Write for UnixUdp {
     fn write(&mut self, buffer: &[u8]) -> Result<usize, IoError> {
-        if self.1.len() == 0 {
+        if self.1.to_str().unwrap_or("").len() == 0 {
             return Err(IoError::new(
                 ErrorKind::NotFound,
-                "Unix datagram path not set",
+                "Unix datagram path not set or is invalid",
             ));
         }
 

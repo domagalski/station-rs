@@ -5,7 +5,7 @@ use std::io::{Error as IoError, ErrorKind, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::ops::Drop;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -25,13 +25,13 @@ type Callback<T, U> = Box<dyn Send + Fn(T) -> Result<U, String>>;
 #[derive(Clone)]
 enum ListenPort {
     TcpPort(u16),
-    Unix(String),
+    Unix(PathBuf),
 }
 
 #[derive(Clone)]
 enum SendPort {
     TcpSocket(SocketAddr),
-    Unix(String),
+    Unix(PathBuf),
 }
 
 /// Possible responses to RPC calls that do not contain callback output.
@@ -160,7 +160,7 @@ impl RpcServer {
         RpcServer::new(name, ListenPort::TcpPort(port), callback)
     }
 
-    /// Create an RPC server bound to a Unix socket.
+    /// Create an RPC server bound to a Unix stream socket.
     ///
     /// Args:
     /// * `name`: A name to refer to the RPC server.
@@ -168,14 +168,14 @@ impl RpcServer {
     /// * `callback`: The function to call on incoming data.
     pub fn with_unix_socket<T, U>(
         name: &'static str,
-        path: &str,
+        path: &Path,
         callback: Callback<T, U>,
     ) -> RpcServer
     where
         T: Debug + DeserializeOwned + Serialize + 'static,
         U: Debug + DeserializeOwned + Serialize + 'static,
     {
-        RpcServer::new(name, ListenPort::Unix(String::from(path)), callback)
+        RpcServer::new(name, ListenPort::Unix(PathBuf::from(path)), callback)
     }
 
     /// Check if the RPC server is running.
@@ -207,7 +207,7 @@ impl RpcServer {
         );
     }
 
-    fn send_stop_signal_unix(&self, path: &str) {
+    fn send_stop_signal_unix(&self, path: &Path) {
         net::write_stop_signal(UnixStream::connect(path), &self.name);
     }
 }
@@ -245,9 +245,9 @@ where
         RpcClient::new(SendPort::TcpSocket(addr))
     }
 
-    /// Create an RPC client pointing to a Unix socket address.
-    pub fn with_unix_socket(path: &str) -> RpcClient<T, U> {
-        RpcClient::new(SendPort::Unix(String::from(path)))
+    /// Create an RPC client pointing to a Unix stream socket address.
+    pub fn with_unix_socket(path: &Path) -> RpcClient<T, U> {
+        RpcClient::new(SendPort::Unix(PathBuf::from(path)))
     }
 
     /// Call the RPC and return the response.
@@ -504,13 +504,13 @@ where
 }
 
 struct UnixRpcSender {
-    path: String,
+    path: PathBuf,
 }
 
 impl UnixRpcSender {
-    fn new(path: &str) -> UnixRpcSender {
+    fn new(path: &Path) -> UnixRpcSender {
         UnixRpcSender {
-            path: String::from(path),
+            path: PathBuf::from(path),
         }
     }
 }
@@ -576,9 +576,8 @@ mod tests {
         setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
-        let socket = socket.as_path().to_str().unwrap();
         let mut server: RpcServer =
-            RpcServer::with_unix_socket::<i32, ()>("test", socket, Box::new(|_| Ok(())));
+            RpcServer::with_unix_socket::<i32, ()>("test", &socket, Box::new(|_| Ok(())));
         assert!(server.is_running());
         server.stop();
         assert!(!server.is_running());
@@ -605,12 +604,11 @@ mod tests {
         setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
-        let socket = socket.as_path().to_str().unwrap();
         let server: RpcServer =
-            RpcServer::with_unix_socket::<i32, i32>("test", socket, Box::new(|x| Ok(x + 1)));
+            RpcServer::with_unix_socket::<i32, i32>("test", &socket, Box::new(|x| Ok(x + 1)));
         assert!(server.is_running());
 
-        let client: RpcClient<i32, i32> = RpcClient::with_unix_socket(socket);
+        let client: RpcClient<i32, i32> = RpcClient::with_unix_socket(&socket);
         client.wait_for_server(Duration::from_millis(100));
         let response = client.call(1, Duration::from_secs(5));
         assert_eq!(response.unwrap(), 2);
@@ -643,15 +641,14 @@ mod tests {
         setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
-        let socket = socket.as_path().to_str().unwrap();
         let server: RpcServer = RpcServer::with_unix_socket::<i32, i32>(
             "test",
-            socket,
+            &socket,
             Box::new(|_| Err(String::from("callback example error"))),
         );
         assert!(server.is_running());
 
-        let client: RpcClient<i32, i32> = RpcClient::with_unix_socket(socket);
+        let client: RpcClient<i32, i32> = RpcClient::with_unix_socket(&socket);
         client.wait_for_server(Duration::from_millis(100));
         let response = client.call(0, Duration::from_secs(5));
         let err = response.unwrap_err();
@@ -688,12 +685,11 @@ mod tests {
         setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
-        let socket = socket.as_path().to_str().unwrap();
         let server: RpcServer =
-            RpcServer::with_unix_socket::<i32, i32>("test", socket, Box::new(|x| Ok(x + 1)));
+            RpcServer::with_unix_socket::<i32, i32>("test", &socket, Box::new(|x| Ok(x + 1)));
         assert!(server.is_running());
 
-        let client: RpcClient<String, String> = RpcClient::with_unix_socket(socket);
+        let client: RpcClient<String, String> = RpcClient::with_unix_socket(&socket);
         client.wait_for_server(Duration::from_millis(100));
 
         let response = client.call(String::from("hello"), Duration::from_secs(5));
@@ -756,16 +752,15 @@ mod tests {
         setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
-        let socket = socket.as_path().to_str().unwrap();
 
         let server: RpcServer = RpcServer::with_unix_socket::<TwoInts, OneInt>(
             "test",
-            socket,
+            &socket,
             Box::new(|_| Ok(OneInt { num: 0 })),
         );
         assert!(server.is_running());
 
-        let client: RpcClient<OneInt, TwoInts> = RpcClient::with_unix_socket(socket);
+        let client: RpcClient<OneInt, TwoInts> = RpcClient::with_unix_socket(&socket);
         client.wait_for_server(Duration::from_millis(100));
 
         let response = client.call(OneInt { num: 10 }, Duration::from_secs(5));
@@ -804,12 +799,14 @@ mod tests {
         setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
-        let socket = socket.as_path().to_str().unwrap();
-        let server: RpcServer =
-            RpcServer::with_unix_socket::<String, usize>("test", socket, Box::new(|x| Ok(x.len())));
+        let server: RpcServer = RpcServer::with_unix_socket::<String, usize>(
+            "test",
+            &socket,
+            Box::new(|x| Ok(x.len())),
+        );
         assert!(server.is_running());
 
-        let client: RpcClient<String, usize> = RpcClient::with_unix_socket(socket);
+        let client: RpcClient<String, usize> = RpcClient::with_unix_socket(&socket);
         client.wait_for_server(Duration::from_millis(100));
 
         let size = 5000;
@@ -859,14 +856,13 @@ mod tests {
         setup_logging();
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("socket");
-        let socket = socket.as_path().to_str().unwrap();
 
         let stop = Arc::new(RwLock::new(false));
         let stop_requested = Arc::clone(&stop);
 
         let server: RpcServer = RpcServer::with_unix_socket::<i32, i32>(
             "test",
-            socket,
+            &socket,
             Box::new(move |_| {
                 loop {
                     thread::sleep(Duration::from_millis(1));
@@ -879,7 +875,7 @@ mod tests {
         );
         assert!(server.is_running());
 
-        let client: RpcClient<i32, i32> = RpcClient::with_unix_socket(socket);
+        let client: RpcClient<i32, i32> = RpcClient::with_unix_socket(&socket);
         let result = client.call(0, Duration::from_millis(100));
         log::trace!("{:?}", result);
         assert!(result.is_err());
