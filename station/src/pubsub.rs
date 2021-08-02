@@ -461,6 +461,8 @@ mod tests {
             }
         }
 
+        setup_logging();
+
         let null_message = TestMessage {
             name: String::new(),
             value: 0,
@@ -534,6 +536,7 @@ mod tests {
 
     #[test]
     fn many_publishers_one_subscriber_udp() {
+        setup_logging();
         let mut publisher = Publisher::new("test");
         let capture = Arc::new(Mutex::new(HashMap::new()));
         let cb_capture_a = Arc::clone(&capture);
@@ -582,6 +585,7 @@ mod tests {
 
     #[test]
     fn many_publishers_one_subscriber_unix_datagram() {
+        setup_logging();
         let mut publisher = Publisher::new("test");
         let capture = Arc::new(Mutex::new(HashMap::new()));
         let cb_capture_a = Arc::clone(&capture);
@@ -633,6 +637,7 @@ mod tests {
 
     #[test]
     fn no_duplicate_publishers() {
+        setup_logging();
         let mut publisher: Publisher<u32> = Publisher::new("test");
 
         let udp_port: u16 = portpicker::pick_unused_port().unwrap();
