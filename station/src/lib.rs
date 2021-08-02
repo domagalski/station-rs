@@ -8,6 +8,6 @@
 pub(crate) mod net;
 
 //pub mod process;
-//pub mod pubsub;
+pub mod pubsub;
 pub mod rpc;
 //pub mod station;
