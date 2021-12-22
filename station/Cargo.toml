@@ -8,7 +8,7 @@ keywords = ["station", "ipc", "pubsub", "rpc",  "network"]
 categories = ["command-line-utilities", "network-programming"]
 readme = "README.md"
 license = "MIT"
-version = "0.0.7"
+version = "0.0.8"
 authors = ["Rachel Domagalski"]
 edition = "2018"
 
@@ -21,6 +21,7 @@ parking_lot = "0.11"
 pretty_env_logger = "0.4.0"
 regex = "1"
 serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.8"
 
 [dev-dependencies]
 env_logger = "0.8"
