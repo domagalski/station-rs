@@ -20,7 +20,7 @@ use serde::Serialize;
 use crate::net;
 
 // the callback type for passing closures into a new RPC handler.
-type Callback<T, U> = Box<dyn Send + Fn(T) -> Result<U, String>>;
+pub type Callback<T, U> = Box<dyn Send + Fn(T) -> Result<U, String>>;
 
 #[derive(Clone)]
 enum ListenPort {
@@ -107,7 +107,7 @@ impl RpcServer {
         let thread = thread::spawn(move || {
             let listener: Box<dyn RpcListener<T, U>> = match thread_listen_port {
                 ListenPort::TcpPort(port) => Box::new(TcpRpcListener::new(port)),
-                ListenPort::Unix(path) => Box::new(UnixRpcListener::new(Path::new(&path))),
+                ListenPort::Unix(path) => Box::new(UnixRpcListener::new(&path)),
             };
 
             while !*is_stop_requested.read() {

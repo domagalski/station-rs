@@ -1,12 +1,12 @@
 use std::collections::HashMap;
+use std::env;
 use std::error::Error;
 use std::fmt::{Debug, Display, Error as FmtError, Formatter};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Error as IoError, ErrorKind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_yaml;
 
 type ConfigResult<T> = Result<T, ConfigError>;
 
@@ -175,6 +175,57 @@ impl Config {
     }
 }
 
+pub const STATION_RUN_DIR_ENV_VAR: &str = "STATION_RUN_DIR";
+const STATION_RUN_DIR_BASENAME: &str = ".station";
+const STATION_UNIX_SOCK_DIR: &str = "sockets";
+
+fn default_run_directory() -> PathBuf {
+    dirs::home_dir()
+        .unwrap()
+        .as_path()
+        .join(STATION_RUN_DIR_BASENAME)
+}
+
+/// Get the station run directory from the environment.
+///
+/// If the `STATION_RUN_DIR` variable is set, use it to set the station run directory, else
+/// `~/.station` is the station root directory. The station run directory determines paths to
+/// configs, logs, and unix sockets.
+pub fn run_dir_from_env() -> PathBuf {
+    match env::var(STATION_RUN_DIR_ENV_VAR) {
+        Ok(value) => {
+            if value.len() > 0 {
+                PathBuf::from(&value)
+            } else {
+                default_run_directory()
+            }
+        }
+        Err(_) => default_run_directory(),
+    }
+}
+
+/// Get the unix socket directory, given a run directory.
+pub fn unix_socket_dir(run_dir: &Path) -> PathBuf {
+    run_dir.join(STATION_UNIX_SOCK_DIR)
+}
+
+/// Get the directory where Unix sockets are expected to be made.
+pub fn unix_socket_dir_from_env() -> PathBuf {
+    unix_socket_dir(&run_dir_from_env())
+}
+
+/// Create the subdirectories expected to exist in the run directory
+pub fn initialize_run_dir(run_dir: &Path) -> bool {
+    let mut success = true;
+    let socket_dir = unix_socket_dir(run_dir);
+    log::trace!("Unix socket directory: {:?}", socket_dir);
+    if let Err(err) = fs::create_dir_all(&socket_dir) {
+        log::error!("Failed to create unix socket directory: {}", err);
+        success = false;
+    }
+    success
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -185,6 +236,7 @@ mod tests {
     use super::*;
 
     fn setup_logging() {
+        env::remove_var(STATION_RUN_DIR_ENV_VAR);
         let _ = env_logger::builder()
             .format(|buf, record| {
                 writeln!(
@@ -289,5 +341,43 @@ mod tests {
         let no_path = Config::read_yaml(&path_404);
         assert!(no_path.is_err());
         log::trace!("path error: {:?}", no_path.err());
+    }
+
+    #[test]
+    fn get_run_dir() {
+        setup_logging();
+        let homedir = dirs::home_dir().unwrap();
+        let run_dir = run_dir_from_env();
+        log::info!("run dir: {:?}", run_dir);
+        assert!(run_dir.starts_with(&homedir));
+
+        env::set_var(STATION_RUN_DIR_ENV_VAR, "");
+        assert!(env::var(STATION_RUN_DIR_ENV_VAR).is_ok());
+        let run_dir = run_dir_from_env();
+        log::info!("run dir: {:?}", run_dir);
+        assert!(run_dir.starts_with(&homedir));
+
+        env::remove_var(STATION_RUN_DIR_ENV_VAR);
+        let tempdir = tempfile::tempdir().unwrap();
+        env::set_var(STATION_RUN_DIR_ENV_VAR, tempdir.path().to_str().unwrap());
+        assert!(env::var(STATION_RUN_DIR_ENV_VAR).is_ok());
+        let run_dir = run_dir_from_env();
+        log::info!("run dir: {:?}", run_dir);
+        assert!(run_dir.starts_with(tempdir.path()));
+        assert!(!run_dir.starts_with(&homedir));
+
+        let socket_dir = unix_socket_dir_from_env();
+        log::info!("socket dir: {:?}", socket_dir);
+        assert!(socket_dir.starts_with(&run_dir));
+        assert!(run_dir.exists());
+        assert!(!socket_dir.exists());
+    }
+
+    #[test]
+    fn test_initialize_run_dir() {
+        let tempdir = tempfile::tempdir().unwrap();
+        assert!(initialize_run_dir(tempdir.path()));
+        let socket_dir = unix_socket_dir(tempdir.path());
+        assert!(socket_dir.exists());
     }
 }

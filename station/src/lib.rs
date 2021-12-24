@@ -8,8 +8,6 @@
 pub(crate) mod net;
 
 pub mod config;
+pub mod process;
 pub mod pubsub;
 pub mod rpc;
-// TODO(implement these)
-//pub mod process;
-//pub mod station;
