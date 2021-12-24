@@ -33,40 +33,10 @@ impl Display for ConfigError {
 
 impl Error for ConfigError {}
 
-/// An entry in a configuration describing the RPC networking.
-#[derive(Debug, Deserialize, Serialize)]
-pub enum ConfigEntry {
-    Port(u16),
-    Unix,
-}
-
-impl ConfigEntry {
-    fn get_port(&self) -> Option<u16> {
-        match self {
-            ConfigEntry::Port(port) => Some(*port),
-            _ => None,
-        }
-    }
-
-    fn is_port(&self) -> bool {
-        match self {
-            ConfigEntry::Port(_) => true,
-            _ => false,
-        }
-    }
-
-    fn is_unix(&self) -> bool {
-        match self {
-            ConfigEntry::Unix => true,
-            _ => false,
-        }
-    }
-}
-
 /// RPC configuration.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
-    rpc: HashMap<String, ConfigEntry>,
+    rpc: HashMap<String, u16>,
 }
 
 impl Config {
@@ -84,71 +54,29 @@ impl Config {
         Ok(())
     }
 
-    /// Add a RPC config that uses a TCP port for IPC.
+    /// Add an RPC config entry based on TCP port usage.
     ///
     /// Args:
     /// * `name`: The name to associate the config with.
     /// * `port`: The TCP port to use for the RPC listener.
-    pub fn add_rpc_port(&mut self, name: &str, port: u16) -> ConfigResult<()> {
+    pub fn add_rpc(&mut self, name: &str, port: u16) -> ConfigResult<()> {
         let result = self.err_rpc_exists(name);
         if result.is_err() {
             return result;
         }
 
-        assert!(self
-            .rpc
-            .insert(String::from(name), ConfigEntry::Port(port))
-            .is_none());
+        assert!(self.rpc.insert(String::from(name), port).is_none());
         Ok(())
     }
 
-    /// Add a RPC config that uses a Unix stream socket for IPC.
-    ///
-    /// Args:
-    /// * `name`: The name to associate the config with, used to construct the socket path.
-    pub fn add_rpc_unix(&mut self, name: &str) -> ConfigResult<()> {
-        let result = self.err_rpc_exists(name);
-        if result.is_err() {
-            return result;
-        }
-
-        assert!(self
-            .rpc
-            .insert(String::from(name), ConfigEntry::Unix)
-            .is_none());
-        Ok(())
-    }
-
-    /// Get the port number for an RPC listener.
+    /// Get the TCP port number for an RPC listener.
     ///
     /// Args:
     /// * `name`: The name in the config entries.
-    pub fn get_rpc_port(&self, name: &str) -> Option<u16> {
+    pub fn get_rpc(&self, name: &str) -> Option<u16> {
         match self.rpc.get(name) {
-            Some(entry) => entry.get_port(),
+            Some(port) => Some(*port),
             None => None,
-        }
-    }
-
-    /// Determine if there is a named config with a port number.
-    ///
-    /// Args:
-    /// * `name`: The name in the config entries.
-    pub fn is_rpc_port(&self, name: &str) -> bool {
-        match self.rpc.get(name) {
-            Some(entry) => entry.is_port(),
-            None => false,
-        }
-    }
-
-    /// Determine if there is a named config marked as Unix socket.
-    ///
-    /// Args:
-    /// * `name`: The name in the config entries.
-    pub fn is_rpc_unix(&self, name: &str) -> bool {
-        match self.rpc.get(name) {
-            Some(entry) => entry.is_unix(),
-            None => false,
         }
     }
 
@@ -257,34 +185,21 @@ mod tests {
         setup_logging();
         let mut config = Config::new();
         assert!(config
-            .add_rpc_port("tcp", portpicker::pick_unused_port().unwrap())
+            .add_rpc("tcp", portpicker::pick_unused_port().unwrap())
             .is_ok());
 
         // should error out, as the config exists.
-        let result = config.add_rpc_port("tcp", portpicker::pick_unused_port().unwrap());
+        let result = config.add_rpc("tcp", portpicker::pick_unused_port().unwrap());
         assert!(result.is_err());
         log::debug!("{}", result.err().unwrap());
-
-        // add a unix path
-        assert!(config.add_rpc_unix("unix").is_ok());
-
-        // also verify that this errors out
-        assert!(config.add_rpc_unix("unix").is_err());
 
         let config = config;
         let yaml = serde_yaml::to_string(&config).unwrap();
         log::debug!("yaml:\n{}", yaml);
 
-        assert!(config.is_rpc_port("tcp"));
-        assert!(!config.is_rpc_unix("tcp"));
-        assert!(config.get_rpc_port("tcp").is_some());
-        let port = config.get_rpc_port("tcp").unwrap();
+        assert!(config.get_rpc("tcp").is_some());
+        let port = config.get_rpc("tcp").unwrap();
         assert!(port > 0);
-        assert!(!config.is_rpc_port("unix"));
-        assert!(config.is_rpc_unix("unix"));
-
-        assert!(!config.is_rpc_port("404"));
-        assert!(!config.is_rpc_unix("404"));
     }
 
     #[test]
@@ -292,9 +207,11 @@ mod tests {
         setup_logging();
         let mut config = Config::new();
         assert!(config
-            .add_rpc_port("cats", portpicker::pick_unused_port().unwrap())
+            .add_rpc("cats", portpicker::pick_unused_port().unwrap())
             .is_ok());
-        assert!(config.add_rpc_unix("dogs").is_ok());
+        assert!(config
+            .add_rpc("dogs", portpicker::pick_unused_port().unwrap())
+            .is_ok());
         let config = config;
         let tempdir = tempfile::tempdir().unwrap();
         let yaml_path = tempdir.path().join("config.yaml");
@@ -308,19 +225,14 @@ mod tests {
         let recovered_config = recovered_config.unwrap();
         log::trace!("recovered config: {:?}", recovered_config);
 
-        assert!(recovered_config.get_rpc_port("cats").is_some());
-        assert!(config.is_rpc_port("cats"));
-        assert!(config.get_rpc_port("cats").is_some());
+        assert!(recovered_config.get_rpc("cats").is_some());
+        assert!(config.get_rpc("cats").is_some());
         assert_eq!(
-            recovered_config.get_rpc_port("cats").unwrap(),
-            config.get_rpc_port("cats").unwrap()
+            recovered_config.get_rpc("cats").unwrap(),
+            config.get_rpc("cats").unwrap()
         );
-        let port = recovered_config.get_rpc_port("cats").unwrap();
+        let port = recovered_config.get_rpc("cats").unwrap();
         assert!(port > 0);
-
-        assert!(recovered_config.is_rpc_unix("dogs"));
-        assert!(!recovered_config.is_rpc_port("404"));
-        assert!(!recovered_config.is_rpc_unix("404"));
     }
 
     #[test]
