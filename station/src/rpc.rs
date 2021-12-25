@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::error::Error;
 use std::fmt::{Debug, Display, Error as FmtError, Formatter};
 use std::io::{Error as IoError, ErrorKind, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::ops::Drop;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -201,10 +201,8 @@ impl RpcServer {
     }
 
     fn send_stop_signal_tcp(&self, port: u16) {
-        net::write_stop_signal(
-            TcpStream::connect(format!("127.0.0.1:{}", port)),
-            &self.name,
-        );
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        net::write_stop_signal(TcpStream::connect(addr), &self.name);
     }
 
     fn send_stop_signal_unix(&self, path: &Path) {
@@ -332,7 +330,7 @@ struct TcpRpcListener {
 
 impl TcpRpcListener {
     fn new(port: u16) -> TcpRpcListener {
-        let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
         let listener =
             TcpListener::bind(addr).expect(&format!("Cannot bind to TCP port: {}", port));
         TcpRpcListener {
@@ -592,7 +590,7 @@ mod tests {
             RpcServer::with_tcp_port::<i32, i32>("test", port, Box::new(|x| Ok(x + 1)));
         assert!(server.is_running());
 
-        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let client: RpcClient<i32, i32> = RpcClient::with_tcp_addr(addr);
         client.wait_for_server(Duration::from_millis(100));
         let response = client.call(1, Duration::from_secs(5));
@@ -626,7 +624,7 @@ mod tests {
         );
         assert!(server.is_running());
 
-        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let client: RpcClient<i32, i32> = RpcClient::with_tcp_addr(addr);
         let response = client.call(0, Duration::from_secs(5));
         let err = response.unwrap_err();
@@ -667,7 +665,7 @@ mod tests {
             RpcServer::with_tcp_port::<i32, i32>("test", port, Box::new(|x| Ok(x + 1)));
         assert!(server.is_running());
 
-        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let client: RpcClient<String, String> = RpcClient::with_tcp_addr(addr);
         client.wait_for_server(Duration::from_millis(100));
 
@@ -724,7 +722,7 @@ mod tests {
         );
         assert!(server.is_running());
 
-        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let client: RpcClient<OneInt, TwoInts> = RpcClient::with_tcp_addr(addr);
         client.wait_for_server(Duration::from_millis(100));
 
@@ -780,7 +778,7 @@ mod tests {
             RpcServer::with_tcp_port::<String, usize>("test", port, Box::new(|x| Ok(x.len())));
         assert!(server.is_running());
 
-        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let client: RpcClient<String, usize> = RpcClient::with_tcp_addr(addr);
 
         let size = 5000;
@@ -843,7 +841,7 @@ mod tests {
         );
         assert!(server.is_running());
 
-        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let client: RpcClient<i32, i32> = RpcClient::with_tcp_addr(addr);
         let result = client.call(0, Duration::from_millis(100));
         log::trace!("{:?}", result);

@@ -34,7 +34,7 @@ impl Display for ConfigError {
 impl Error for ConfigError {}
 
 /// RPC configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
     rpc: HashMap<String, u16>,
 }
