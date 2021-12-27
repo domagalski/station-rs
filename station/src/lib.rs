@@ -11,3 +11,6 @@ pub mod config;
 pub mod process;
 pub mod pubsub;
 pub mod rpc;
+
+pub use config::Config;
+pub use process::Process;
