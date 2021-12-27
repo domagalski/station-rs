@@ -20,14 +20,14 @@ use crate::rpc::{Callback, RpcClient, RpcError, RpcServer};
 /// processes on the same machine and being specific about configuring endpoints for processes on
 /// two different machines.
 pub struct Process {
-    run_dir: PathBuf,
+    run_dir: Option<PathBuf>,
     config: Config,
     name: String,
     rpc: HashMap<String, RpcServer>,
 }
 
 impl Process {
-    /// Create a new `Process`.
+    /// Create a new `Process` from a config file.
     ///
     /// Args:
     /// * `name`: The name to associate the process with. Best practice is that process names should
@@ -37,23 +37,57 @@ impl Process {
     /// writable by the user ID creating the `Process` instance. Any RPC method listed in the config
     /// at this path must be named as <process_name>.<rpc_name> in order for `Process` to find TCP
     /// configurations when calling RPCs implemented as TCP sockets.
-    pub fn new(name: &str, config_path: &Path) -> Result<Process, IoError> {
+    pub fn from_config_file(name: &str, config_path: &Path) -> Result<Process, IoError> {
         let config_path = config_path.canonicalize()?;
         let config = Config::read_yaml(&config_path)?;
         let run_directory = config_path.parent().unwrap();
-        assert!(config::initialize_run_dir(run_directory));
+        Process::new(name, run_directory, &config)
+    }
+
+    /// Create a new `Process` with a config and run directory.
+    ///
+    /// Args:
+    /// * `name`: The name to associate the process with. Best practice is that process names should
+    /// be unique, as per the convention for automatically defining Unix socket paths.
+    /// * `run_directory`: Path to where Unix sockets will be created for this process.
+    /// * `config`: A process/station configuration defining TCP interfaces.
+    pub fn new(name: &str, run_directory: &Path, config: &Config) -> Result<Process, IoError> {
+        let run_directory = run_directory.canonicalize()?;
+        assert!(config::initialize_run_dir(&run_directory));
         Ok(Process {
-            run_dir: PathBuf::from(run_directory),
+            run_dir: Some(run_directory),
             config: config.clone(),
             name: String::from(name),
             rpc: HashMap::new(),
         })
     }
 
-    fn unix_socket_base(&self) -> PathBuf {
-        config::unix_socket_dir(&self.run_dir)
-            .as_path()
-            .join(&self.name)
+    /// Create a new `Process` from without a run directory.
+    ///
+    /// Because the config has been pre-loaded and no run directory has been specified, the
+    /// `Process` instance returned by this will not support RPC/PubSub with Unix sockets.
+    ///
+    /// Args:
+    /// * `name`: The name to associate the process with. Best practice is that process names should
+    /// be unique, as per the convention for automatically defining Unix socket paths.
+    /// * `config`: A process/station configuration defining TCP interfaces.
+    pub fn without_run_dir(name: &str, config: &Config) -> Process {
+        Process {
+            run_dir: None,
+            config: config.clone(),
+            name: String::from(name),
+            rpc: HashMap::new(),
+        }
+    }
+
+    fn unix_socket_base(&self) -> Result<PathBuf, IoError> {
+        match &self.run_dir {
+            Some(dir) => Ok(config::unix_socket_dir(&dir).as_path().join(&self.name)),
+            None => Err(IoError::new(
+                ErrorKind::Unsupported,
+                format!("Process {} has no run directory", self.name),
+            )),
+        }
     }
 
     fn rpc_config_name(process_name: &str, rpc_name: &str) -> String {
@@ -94,9 +128,17 @@ impl Process {
         let client: RpcClient<T, U> = match self.get_rpc_from_config(process_name, rpc_name) {
             Some(addr) => RpcClient::with_tcp_addr(addr),
             None => {
-                let socket_path = config::unix_socket_dir(&self.run_dir)
-                    .as_path()
-                    .join(Process::rpc_config_name(process_name, rpc_name));
+                let socket_path = match &self.run_dir {
+                    Some(dir) => config::unix_socket_dir(&dir)
+                        .as_path()
+                        .join(Process::rpc_config_name(process_name, rpc_name)),
+                    None => {
+                        return Err(RpcError::IoError(IoError::new(
+                            ErrorKind::Unsupported,
+                            format!("Process {} has no run directory", self.name),
+                        )))
+                    }
+                };
                 RpcClient::with_unix_socket(&socket_path)
             }
         };
@@ -143,7 +185,7 @@ impl Process {
                 RpcServer::with_tcp_port(name, addr.port(), callback)
             }
             None => {
-                let socket_path = self.unix_socket_base().as_path().with_extension(name);
+                let socket_path = self.unix_socket_base()?.as_path().with_extension(name);
                 RpcServer::with_unix_socket(name, &socket_path, callback)
             }
         };
@@ -180,7 +222,7 @@ mod tests {
             .try_init();
     }
 
-    fn create_config(directory: &Path, server_name: &str, rpc_name: &str) -> PathBuf {
+    fn create_config(server_name: &str, rpc_name: &str) -> Config {
         let mut cfg = Config::new();
         cfg.add_rpc(
             &format!("{}.{}", server_name, rpc_name),
@@ -199,9 +241,7 @@ mod tests {
         )
         .unwrap();
         log::trace!("{:?}", cfg);
-        let config_path = directory.join("config.yaml");
-        cfg.write_yaml(&config_path).unwrap();
-        config_path
+        cfg
     }
 
     #[test]
@@ -212,12 +252,8 @@ mod tests {
         let server_name = "rpc-test";
         let client_name = "rpc-client";
 
-        let tempdir = tempfile::tempdir().unwrap();
-        let config_path = create_config(tempdir.path(), server_name, rpc_name);
-        let process = Process::new(server_name, &config_path);
-        assert!(process.is_ok());
-
-        let mut process = process.unwrap();
+        let config = create_config(server_name, rpc_name);
+        let mut process = Process::without_run_dir(server_name, &config);
         assert!(process
             .create_rpc::<i32, i32>(rpc_name, Box::new(|x| Ok(x + 1)))
             .is_ok());
@@ -227,13 +263,21 @@ mod tests {
         assert!(process
             .create_rpc::<i32, i32>("invalid", Box::new(|x| Ok(x + 1)))
             .is_err());
+        assert!(process
+            .create_rpc::<i32, i32>("unspecified", Box::new(|x| Ok(x + 1)))
+            .is_err());
 
-        let client = Process::new(client_name, &config_path).unwrap();
+        let client = Process::without_run_dir(client_name, &config);
         let result = client.call_rpc::<i32, i32>(server_name, rpc_name, 0, Duration::from_secs(5));
 
         assert!(result.is_ok());
         let result = result.unwrap();
         assert_eq!(result, 1);
+
+        // error because no run durectory associated with client, so no unix sockets.
+        assert!(client
+            .call_rpc::<i32, i32>(server_name, "unspecified", 0, Duration::from_secs(5))
+            .is_err());
     }
 
     #[test]
@@ -248,7 +292,7 @@ mod tests {
         let config_path = tempdir.path().join("config.yaml");
         Config::new().write_yaml(&config_path).unwrap();
 
-        let process = Process::new(server_name, &config_path);
+        let process = Process::from_config_file(server_name, &config_path);
         assert!(process.is_ok());
 
         let mut process = process.unwrap();
@@ -259,7 +303,7 @@ mod tests {
             .create_rpc::<i32, i32>(rpc_name, Box::new(|x| Ok(x + 1)))
             .is_err());
 
-        let client = Process::new(client_name, &config_path).unwrap();
+        let client = Process::from_config_file(client_name, &config_path).unwrap();
         let result = client.call_rpc::<i32, i32>(server_name, rpc_name, 0, Duration::from_secs(5));
         assert!(result.is_ok());
         let result = result.unwrap();
