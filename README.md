@@ -4,19 +4,19 @@ A network-based interprocess communication (IPC) library written in Rust.
 NOTE: this is heavily under development and not everything is available.
 Anything version less than v0.1.0 is incomplete.
 
+I'm writing this to be useful to me. It might not be useful for you.
+
 ## Structure
 
-The `station` design is heavily influenced by [ROS](https://www.ros.org/) and
-aims to create an interface with similar patterns. `station` can run either on
-one machine or many machines and the networking protocol used to transmit
-messages between processes is designed to be flexible.
+The `station` design is fairly straightforward. It implements two types of IPC,
+namely Remote Procedure Calls (RPC) and PubSub. RPC communication is performed
+over a stream socket (TCP or Unix stream sockets) and PubSub communication is
+performed over datagram sockets (UDP or Unix datagram sockets). This allows
+some flexibility in defining how two processes that may or may not be running
+on the same machine can talk to each other.
 
 The `station` module has several main types:
-* `Station`: A `Station` tracks and managers all incoming and outgoing messages
-on a machine and connects to other machines running `station`. There is
-typically one instance of `station` running per machine.
-* `Process`: A `Process` connects to the local `station` instance and registers
-connections to pubsub topics and RPC channels.
+* `Process`: A `Process` instance is a helper around RPC and PubSub patterns.
 * `Publisher`: Publish a message with the `Serialize` and `Deserialize` traits
 to a topic.
 * `Subscriber`: Subscribe to a topic and process messages via a callback.
@@ -27,9 +27,7 @@ to a topic.
 
 * [x] TCP RPC
 * [x] Unix Stream Socket RPC
-* [x] UDP Pubsub
-* [x] Unix Datagram Socket Pubsub
-* [ ] Station/Task nodes
-* [ ] Type Configuration
-
-I may or may not add a TCP and Unix Stream pubsub mechanism.
+* [x] UDP PubSub
+* [x] Unix Datagram Socket PubSub
+* [x] Process with RPC configuration.
+* [ ] Process with PubSub configuration.
