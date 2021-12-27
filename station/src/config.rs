@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt::{Debug, Display, Error as FmtError, Formatter};
 use std::fs::{self, File};
 use std::io::{Error as IoError, ErrorKind};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -36,7 +37,7 @@ impl Error for ConfigError {}
 /// RPC configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
-    rpc: HashMap<String, u16>,
+    rpc: HashMap<String, SocketAddr>,
 }
 
 impl Config {
@@ -58,14 +59,14 @@ impl Config {
     ///
     /// Args:
     /// * `name`: The name to associate the config with.
-    /// * `port`: The TCP port to use for the RPC listener.
-    pub fn add_rpc(&mut self, name: &str, port: u16) -> ConfigResult<()> {
+    /// * `addr`: The TCP socket address to use for the RPC listener.
+    pub fn add_rpc(&mut self, name: &str, addr: &SocketAddr) -> ConfigResult<()> {
         let result = self.err_rpc_exists(name);
         if result.is_err() {
             return result;
         }
 
-        assert!(self.rpc.insert(String::from(name), port).is_none());
+        assert!(self.rpc.insert(String::from(name), *addr).is_none());
         Ok(())
     }
 
@@ -73,9 +74,9 @@ impl Config {
     ///
     /// Args:
     /// * `name`: The name in the config entries.
-    pub fn get_rpc(&self, name: &str) -> Option<u16> {
+    pub fn get_rpc(&self, name: &str) -> Option<SocketAddr> {
         match self.rpc.get(name) {
-            Some(port) => Some(*port),
+            Some(addr) => Some(*addr),
             None => None,
         }
     }
@@ -157,6 +158,7 @@ pub fn initialize_run_dir(run_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use log;
     use portpicker;
@@ -180,16 +182,21 @@ mod tests {
             .try_init();
     }
 
+    fn pick_unused_addr() -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            portpicker::pick_unused_port().unwrap(),
+        )
+    }
+
     #[test]
     fn add_items_to_config() {
         setup_logging();
         let mut config = Config::new();
-        assert!(config
-            .add_rpc("tcp", portpicker::pick_unused_port().unwrap())
-            .is_ok());
+        assert!(config.add_rpc("tcp", &pick_unused_addr()).is_ok());
 
         // should error out, as the config exists.
-        let result = config.add_rpc("tcp", portpicker::pick_unused_port().unwrap());
+        let result = config.add_rpc("tcp", &pick_unused_addr());
         assert!(result.is_err());
         log::debug!("{}", result.err().unwrap());
 
@@ -198,20 +205,16 @@ mod tests {
         log::debug!("yaml:\n{}", yaml);
 
         assert!(config.get_rpc("tcp").is_some());
-        let port = config.get_rpc("tcp").unwrap();
-        assert!(port > 0);
+        let addr = config.get_rpc("tcp").unwrap();
+        assert!(addr.port() > 0);
     }
 
     #[test]
     fn load_save_config_file() {
         setup_logging();
         let mut config = Config::new();
-        assert!(config
-            .add_rpc("cats", portpicker::pick_unused_port().unwrap())
-            .is_ok());
-        assert!(config
-            .add_rpc("dogs", portpicker::pick_unused_port().unwrap())
-            .is_ok());
+        assert!(config.add_rpc("cats", &pick_unused_addr()).is_ok());
+        assert!(config.add_rpc("dogs", &pick_unused_addr()).is_ok());
         let config = config;
         let tempdir = tempfile::tempdir().unwrap();
         let yaml_path = tempdir.path().join("config.yaml");
@@ -231,8 +234,8 @@ mod tests {
             recovered_config.get_rpc("cats").unwrap(),
             config.get_rpc("cats").unwrap()
         );
-        let port = recovered_config.get_rpc("cats").unwrap();
-        assert!(port > 0);
+        let addr = recovered_config.get_rpc("cats").unwrap();
+        assert!(addr.port() > 0);
     }
 
     #[test]
