@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fmt::{Debug, Display, Error as FmtError, Formatter};
@@ -34,10 +34,36 @@ impl Display for ConfigError {
 
 impl Error for ConfigError {}
 
-/// RPC configuration.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Network endpoint configuration for a PubSub topic.
+#[derive(Clone, Debug, Eq, Deserialize, Hash, Serialize, PartialEq)]
+pub enum PubSubEndpoint {
+    Udp(SocketAddr),
+    Unix(String),
+}
+
+impl PubSubEndpoint {
+    /// Get the UDP socket address for a UDP endpoint.
+    pub fn udp(&self) -> Option<SocketAddr> {
+        match self {
+            PubSubEndpoint::Udp(addr) => Some(*addr),
+            _ => None,
+        }
+    }
+
+    /// Get the name to use to construct a Unix socket.
+    pub fn unix(&self) -> Option<String> {
+        match self {
+            PubSubEndpoint::Unix(name) => Some(String::from(name)),
+            _ => None,
+        }
+    }
+}
+
+/// RPC and PubSub configuration.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Config {
     rpc: HashMap<String, SocketAddr>,
+    pubsub: HashMap<String, HashSet<PubSubEndpoint>>,
 }
 
 impl Config {
@@ -45,6 +71,7 @@ impl Config {
     pub fn new() -> Config {
         Config {
             rpc: HashMap::new(),
+            pubsub: HashMap::new(),
         }
     }
 
@@ -61,11 +88,7 @@ impl Config {
     /// * `name`: The name to associate the config with.
     /// * `addr`: The TCP socket address to use for the RPC listener.
     pub fn add_rpc(&mut self, name: &str, addr: &SocketAddr) -> ConfigResult<()> {
-        let result = self.err_rpc_exists(name);
-        if result.is_err() {
-            return result;
-        }
-
+        self.err_rpc_exists(name)?;
         assert!(self.rpc.insert(String::from(name), *addr).is_none());
         Ok(())
     }
@@ -77,6 +100,30 @@ impl Config {
     pub fn get_rpc(&self, name: &str) -> Option<SocketAddr> {
         match self.rpc.get(name) {
             Some(addr) => Some(*addr),
+            None => None,
+        }
+    }
+
+    /// Add a PubSub endpoint to the config.
+    ///
+    /// Args:
+    /// * `topic`: The PubSub topic to add the endpoint to.
+    /// * `endpoint`: An endpoint for a publisher to publish to.
+    pub fn add_pubsub(&mut self, topic: &str, endpoint: &PubSubEndpoint) {
+        let topic_config = self
+            .pubsub
+            .entry(String::from(topic))
+            .or_insert(HashSet::new());
+        topic_config.insert(endpoint.clone());
+    }
+
+    /// Get a set of PubSub subscriber endpoints for a topic.
+    ///
+    /// Args:
+    /// * `topic`: The PubSub topic to fetch endpoint configs for.
+    pub fn get_pubsub(&self, topic: &str) -> Option<HashSet<PubSubEndpoint>> {
+        match self.pubsub.get(topic) {
+            Some(config) => Some(config.clone()),
             None => None,
         }
     }
@@ -215,7 +262,16 @@ mod tests {
         let mut config = Config::new();
         assert!(config.add_rpc("cats", &pick_unused_addr()).is_ok());
         assert!(config.add_rpc("dogs", &pick_unused_addr()).is_ok());
+        config.add_pubsub("turtles", &PubSubEndpoint::Unix(String::from("rabbits")));
+        config.add_pubsub("turtles", &PubSubEndpoint::Udp(pick_unused_addr()));
+        config.add_pubsub("coffee", &PubSubEndpoint::Unix(String::from("donuts")));
+        // coffee.donuts is already inserted, so re-inserting does nothing, but is fine
+        config.add_pubsub("coffee", &PubSubEndpoint::Unix(String::from("donuts")));
+        config.add_pubsub("coffee", &PubSubEndpoint::Udp(pick_unused_addr()));
+        config.add_pubsub("coffee", &PubSubEndpoint::Udp(pick_unused_addr()));
         let config = config;
+        assert!(config.get_rpc("cats").is_some());
+
         let tempdir = tempfile::tempdir().unwrap();
         let yaml_path = tempdir.path().join("config.yaml");
         assert!(config.write_yaml(&yaml_path).is_ok());
@@ -228,14 +284,15 @@ mod tests {
         let recovered_config = recovered_config.unwrap();
         log::trace!("recovered config: {:?}", recovered_config);
 
+        assert_eq!(recovered_config, config);
+        assert!(recovered_config.get_rpc("dogs").is_some());
         assert!(recovered_config.get_rpc("cats").is_some());
-        assert!(config.get_rpc("cats").is_some());
-        assert_eq!(
-            recovered_config.get_rpc("cats").unwrap(),
-            config.get_rpc("cats").unwrap()
-        );
         let addr = recovered_config.get_rpc("cats").unwrap();
         assert!(addr.port() > 0);
+        assert!(recovered_config.get_pubsub("turtles").is_some());
+        assert_eq!(recovered_config.get_pubsub("turtles").unwrap().len(), 2);
+        assert!(recovered_config.get_pubsub("coffee").is_some());
+        assert_eq!(recovered_config.get_pubsub("coffee").unwrap().len(), 3);
     }
 
     #[test]
