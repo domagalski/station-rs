@@ -14,3 +14,4 @@ pub mod rpc;
 
 pub use config::Config;
 pub use process::Process;
+pub use rpc::RpcError;
