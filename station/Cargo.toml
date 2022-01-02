@@ -8,7 +8,7 @@ keywords = ["station", "ipc", "pubsub", "rpc",  "network"]
 categories = ["command-line-utilities", "network-programming"]
 readme = "README.md"
 license = "MIT"
-version = "0.0.14"
+version = "0.0.15"
 authors = ["Rachel Domagalski"]
 edition = "2018"
 

@@ -202,6 +202,9 @@ impl Process {
 
     /// Publish a message to a topic.
     ///
+    /// The topic must be defined in the `Process` config. Additionally, if publishing to a Unix
+    /// socket, the run directory for the proces must exist.
+    ///
     /// Args:
     /// * `topic`: The PubSub topic to publish to.
     /// * `message`: The data to publish.
@@ -246,6 +249,10 @@ impl Process {
     }
 
     /// Subscribe to a topic.
+    ///
+    /// The topic must be defined in the `Process` config and there must be an endpoint listed for
+    /// the `Process` name. If the endpoint is a UDP endpoint, it must be a local address.
+    /// Additionally, if the topic has already been subscribed to, an error will be returned.
     ///
     /// Args:
     /// * `topic`: The PubSub topic to subscribe to.
@@ -450,6 +457,18 @@ mod tests {
             )
             .is_ok());
         assert!(cfg
+            .add_pubsub(
+                "counter",
+                &PubSubEndpoint::new_udp_endpoint(
+                    "invalid",
+                    SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+                        portpicker::pick_unused_port().unwrap(),
+                    )
+                )
+            )
+            .is_ok());
+        assert!(cfg
             .add_pubsub("counter", &PubSubEndpoint::new_unix_endpoint("unix",))
             .is_ok());
         let cfg = cfg;
@@ -478,6 +497,20 @@ mod tests {
                 .is_ok());
         }
 
+        // error out because already subscribed
+        {
+            let counter = Arc::clone(&unix_counter);
+            assert!(unix_sub
+                .subscribe_to_topic::<i32>(
+                    "counter",
+                    Box::new(move |_| {
+                        log::trace!("got a message on the unix subscriber");
+                        *counter.lock() += 1;
+                    })
+                )
+                .is_err());
+        }
+
         let udp_sub = Process::from_config_file("udp", &config_path);
         assert!(udp_sub.is_ok());
         let mut udp_sub = udp_sub.unwrap();
@@ -493,6 +526,20 @@ mod tests {
                     })
                 )
                 .is_ok());
+
+            // topic doesn't exist
+            assert!(udp_sub
+                .subscribe_to_topic::<i32>("404", Box::new(move |_| { log::trace!("hello") }))
+                .is_err());
+        }
+
+        {
+            let invalid_sub = Process::from_config_file("invalid", &config_path);
+            assert!(invalid_sub.is_ok());
+            let mut invalid_sub = invalid_sub.unwrap();
+            assert!(invalid_sub
+                .subscribe_to_topic::<i32>("counter", Box::new(move |_| log::trace!("hello")))
+                .is_err());
         }
 
         let publisher = Process::from_config_file("publisher", &config_path);

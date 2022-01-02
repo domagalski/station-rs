@@ -30,4 +30,4 @@ to a topic.
 * [x] UDP PubSub
 * [x] Unix Datagram Socket PubSub
 * [x] Process with RPC configuration.
-* [ ] Process with PubSub configuration.
+* [x] Process with PubSub configuration.
