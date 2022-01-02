@@ -1,5 +1,40 @@
+//! Basic configuration system for `Process` objects in the `station` crate.
+//!
+//! The `Config` struct is used to hold RPC and PubSub configurations and can be written/read as
+//! YAML. The RPC section is used to configure TCP addresses only, whereas RPC via Unix sockets are
+//! automatically determined from a run directory that `Process` uses. The PubSub configuration,
+//! however, contains both UDP and Unix datagram socket configurations, as it's used to determine
+//! the various endpoints a publisher must publish to.
+//!
+//! Example configration YAML:
+//! ```text
+//! rpc:
+//!   ## Process named "pets" with "dogs" and "cats" methods.
+//!   pets.dogs: "127.0.0.1:15003"
+//!   pets.cats: "127.0.0.1:17970"
+//!   # Process named "class" with "lecture" method.
+//!   class.lecture: "127.0.0.1:16928"
+//! pubsub:
+//!   ## Topic named "coffee" with subscriptions in the "mocha", "donuts", and "latte" processes.
+//!   coffee:
+//!     - name: mocha
+//!       config:
+//!         Udp: "127.0.0.1:21840"
+//!     - name: donuts
+//!       config: Unix
+//!     - name: latte
+//!       config:
+//!         Udp: "127.0.0.1:18859"
+//!   ## Topic named "turtles" with subscriptions in the "rabbits" and "shell" processes.
+//!   turtles:
+//!     - name: rabbits
+//!       config: Unix
+//!     - name: shell
+//!       config:
+//!         Udp: "127.0.0.1:15069"
+//! ```
+
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::error::Error;
 use std::fmt::{Debug, Display, Error as FmtError, Formatter};
 use std::fs::{self, File};
@@ -221,46 +256,14 @@ impl Config {
     }
 }
 
-pub const STATION_RUN_DIR_ENV_VAR: &str = "STATION_RUN_DIR";
-const STATION_RUN_DIR_BASENAME: &str = ".station";
-const STATION_UNIX_SOCK_DIR: &str = "sockets";
-
-fn default_run_directory() -> PathBuf {
-    dirs::home_dir()
-        .unwrap()
-        .as_path()
-        .join(STATION_RUN_DIR_BASENAME)
-}
-
-/// Get the station run directory from the environment.
+/// Get the unix socket directory for a run directory.
 ///
-/// If the `STATION_RUN_DIR` variable is set, use it to set the station run directory, else
-/// `~/.station` is the station root directory. The station run directory determines paths to
-/// configs, logs, and unix sockets.
-pub fn run_dir_from_env() -> PathBuf {
-    match env::var(STATION_RUN_DIR_ENV_VAR) {
-        Ok(value) => {
-            if value.len() > 0 {
-                PathBuf::from(&value)
-            } else {
-                default_run_directory()
-            }
-        }
-        Err(_) => default_run_directory(),
-    }
-}
-
-/// Get the unix socket directory, given a run directory.
+/// This evaluates to `<run_dir>/sockets`.
 pub fn unix_socket_dir(run_dir: &Path) -> PathBuf {
-    run_dir.join(STATION_UNIX_SOCK_DIR)
+    run_dir.join("sockets")
 }
 
-/// Get the directory where Unix sockets are expected to be made.
-pub fn unix_socket_dir_from_env() -> PathBuf {
-    unix_socket_dir(&run_dir_from_env())
-}
-
-/// Create the subdirectories expected to exist in the run directory
+/// Create the subdirectories expected to exist in the run directory.
 pub fn initialize_run_dir(run_dir: &Path) -> bool {
     let mut success = true;
     let socket_dir = unix_socket_dir(run_dir);
@@ -283,7 +286,6 @@ mod tests {
     use super::*;
 
     fn setup_logging() {
-        env::remove_var(STATION_RUN_DIR_ENV_VAR);
         let _ = env_logger::builder()
             .format(|buf, record| {
                 writeln!(
@@ -421,36 +423,6 @@ mod tests {
         let no_path = Config::read_yaml(&path_404);
         assert!(no_path.is_err());
         log::trace!("path error: {:?}", no_path.err());
-    }
-
-    #[test]
-    fn get_run_dir() {
-        setup_logging();
-        let homedir = dirs::home_dir().unwrap();
-        let run_dir = run_dir_from_env();
-        log::info!("run dir: {:?}", run_dir);
-        assert!(run_dir.starts_with(&homedir));
-
-        env::set_var(STATION_RUN_DIR_ENV_VAR, "");
-        assert!(env::var(STATION_RUN_DIR_ENV_VAR).is_ok());
-        let run_dir = run_dir_from_env();
-        log::info!("run dir: {:?}", run_dir);
-        assert!(run_dir.starts_with(&homedir));
-
-        env::remove_var(STATION_RUN_DIR_ENV_VAR);
-        let tempdir = tempfile::tempdir().unwrap();
-        env::set_var(STATION_RUN_DIR_ENV_VAR, tempdir.path().to_str().unwrap());
-        assert!(env::var(STATION_RUN_DIR_ENV_VAR).is_ok());
-        let run_dir = run_dir_from_env();
-        log::info!("run dir: {:?}", run_dir);
-        assert!(run_dir.starts_with(tempdir.path()));
-        assert!(!run_dir.starts_with(&homedir));
-
-        let socket_dir = unix_socket_dir_from_env();
-        log::info!("socket dir: {:?}", socket_dir);
-        assert!(socket_dir.starts_with(&run_dir));
-        assert!(run_dir.exists());
-        assert!(!socket_dir.exists());
     }
 
     #[test]

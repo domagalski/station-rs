@@ -1,3 +1,5 @@
+//! Publish-Subscribe implementation.
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -232,10 +234,13 @@ impl Subscriber {
         let subscriber_name = Arc::new(String::from(name));
         let thread = thread::spawn(move || {
             let subscriber: Box<dyn SubscribeHandler<T>> = match thread_subscribe_port {
-                SubscriberPort::UdpPort(port) => Box::new(UdpSubscriber::new(port)),
-                SubscriberPort::UnixDatagram(path) => {
-                    Box::new(UnixDatagramSubscriber::new(Path::new(&path)))
+                SubscriberPort::UdpPort(port) => {
+                    Box::new(UdpSubscriber::new(&subscriber_name, port))
                 }
+                SubscriberPort::UnixDatagram(path) => Box::new(UnixDatagramSubscriber::new(
+                    &subscriber_name,
+                    Path::new(&path),
+                )),
             };
             while !*is_stop_requested.read() {
                 match subscriber.recv() {
@@ -343,10 +348,15 @@ struct UdpSubscriber {
 }
 
 impl UdpSubscriber {
-    fn new(port: u16) -> UdpSubscriber {
+    fn new(name: &str, port: u16) -> UdpSubscriber {
         let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
         let listener = UdpSocket::bind(addr).expect(&format!("Cannot bind to UDP port: {}", port));
 
+        log::trace!(
+            "Creating UDP subscriber '{}' listening on address: {}",
+            name,
+            addr
+        );
         UdpSubscriber {
             udp: RefCell::new(Some(Udp::new(listener))),
         }
@@ -370,7 +380,12 @@ struct UnixDatagramSubscriber {
 }
 
 impl UnixDatagramSubscriber {
-    fn new(path: &Path) -> UnixDatagramSubscriber {
+    fn new(name: &str, path: &Path) -> UnixDatagramSubscriber {
+        log::trace!(
+            "Creating Unix socket subscriber '{}' listening on path: {}",
+            name,
+            path.display()
+        );
         UnixDatagramSubscriber {
             unix: RefCell::new(Some(UnixUdp::new(
                 UnixDatagram::bind(path)

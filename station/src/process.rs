@@ -1,3 +1,5 @@
+//! `Process` node system to assist with RPC/PubSub usage.
+
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::{Error as IoError, ErrorKind};
@@ -148,6 +150,7 @@ impl Process {
                 RpcClient::with_unix_socket(&socket_path)
             }
         };
+        client.wait_for_server(timeout);
         client.call(request, timeout)
     }
 
@@ -244,6 +247,12 @@ impl Process {
             }
         }
 
+        log::trace!(
+            "Publishing to {} endpoints on topic '{}' from process: {}",
+            publisher.num_endpoints(),
+            topic,
+            self.name
+        );
         publisher.publish(message);
         Ok(())
     }

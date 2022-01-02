@@ -1,3 +1,5 @@
+//! Remote Procedure Call (RPC) implementation.
+
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt::{Debug, Display, Error as FmtError, Formatter};
