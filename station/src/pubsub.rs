@@ -246,7 +246,7 @@ impl Subscriber {
                 match subscriber.recv() {
                     Ok(msg) => (*callback)(msg),
                     Err(err) => {
-                        log::debug!(
+                        log::trace!(
                             "recv error on Subscriber '{}' with error:\n{}",
                             subscriber_name,
                             err
@@ -352,7 +352,7 @@ impl UdpSubscriber {
         let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
         let listener = UdpSocket::bind(addr).expect(&format!("Cannot bind to UDP port: {}", port));
 
-        log::trace!(
+        log::debug!(
             "Creating UDP subscriber '{}' listening on address: {}",
             name,
             addr
@@ -381,7 +381,7 @@ struct UnixDatagramSubscriber {
 
 impl UnixDatagramSubscriber {
     fn new(name: &str, path: &Path) -> UnixDatagramSubscriber {
-        log::trace!(
+        log::debug!(
             "Creating Unix socket subscriber '{}' listening on path: {}",
             name,
             path.display()

@@ -114,7 +114,7 @@ impl RpcServer {
                 let req = match listener.recv_request() {
                     Ok(req) => req,
                     Err(err) => {
-                        log::debug!(
+                        log::trace!(
                             "recv_request error on RPC handler '{}' with error:\n{}",
                             name,
                             err
@@ -129,7 +129,7 @@ impl RpcServer {
                 };
 
                 if let Err(err) = listener.send_response(resp) {
-                    log::debug!(
+                    log::trace!(
                         "send_response error on RPC handler '{}' with error:\n{}",
                         name,
                         err
@@ -157,7 +157,7 @@ impl RpcServer {
         T: Debug + DeserializeOwned + Serialize + 'static,
         U: Debug + DeserializeOwned + Serialize + 'static,
     {
-        log::trace!("Creating RPC server with TCP port: {}", port);
+        log::debug!("Creating RPC server with TCP port: {}", port);
         RpcServer::new(name, ListenPort::TcpPort(port), callback)
     }
 
@@ -176,7 +176,7 @@ impl RpcServer {
         T: Debug + DeserializeOwned + Serialize + 'static,
         U: Debug + DeserializeOwned + Serialize + 'static,
     {
-        log::trace!("Creating RPC server with Unix socket: {}", path.display());
+        log::debug!("Creating RPC server with Unix socket: {}", path.display());
         RpcServer::new(name, ListenPort::Unix(PathBuf::from(path)), callback)
     }
 
@@ -242,13 +242,13 @@ where
 
     /// Create an RPC client pointing to a TCP socket address.
     pub fn with_tcp_addr(addr: SocketAddr) -> RpcClient<T, U> {
-        log::trace!("Creating RPC client to TCP endpoint: {}", addr);
+        log::debug!("Creating RPC client to TCP endpoint: {}", addr);
         RpcClient::new(SendPort::TcpSocket(addr))
     }
 
     /// Create an RPC client pointing to a Unix stream socket address.
     pub fn with_unix_socket(path: &Path) -> RpcClient<T, U> {
-        log::trace!("Creating RPC client to Unix socket: {}", path.display());
+        log::debug!("Creating RPC client to Unix socket: {}", path.display());
         RpcClient::new(SendPort::Unix(PathBuf::from(path)))
     }
 
