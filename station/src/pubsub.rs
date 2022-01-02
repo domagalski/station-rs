@@ -17,7 +17,7 @@ use serde::Serialize;
 use crate::net::{self, Udp, UnixUdp};
 
 // the callback type for passing messages into the callback
-type Callback<T> = Box<dyn Send + Fn(T)>;
+pub type Callback<T> = Box<dyn Send + Fn(T)>;
 
 #[derive(Clone)]
 enum SubscriberPort {
@@ -221,11 +221,7 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
-    fn new<T>(
-        name: &'static str,
-        subscribe_port: SubscriberPort,
-        callback: Callback<T>,
-    ) -> Subscriber
+    fn new<T>(name: &str, subscribe_port: SubscriberPort, callback: Callback<T>) -> Subscriber
     where
         T: Debug + DeserializeOwned + Serialize + 'static,
     {
@@ -233,6 +229,7 @@ impl Subscriber {
         let is_stop_requested = stop_requested.clone();
         let thread_subscribe_port = subscribe_port.clone();
 
+        let subscriber_name = Arc::new(String::from(name));
         let thread = thread::spawn(move || {
             let subscriber: Box<dyn SubscribeHandler<T>> = match thread_subscribe_port {
                 SubscriberPort::UdpPort(port) => Box::new(UdpSubscriber::new(port)),
@@ -244,7 +241,11 @@ impl Subscriber {
                 match subscriber.recv() {
                     Ok(msg) => (*callback)(msg),
                     Err(err) => {
-                        log::debug!("recv error on Subscriber '{}' with error:\n{}", name, err)
+                        log::debug!(
+                            "recv error on Subscriber '{}' with error:\n{}",
+                            subscriber_name,
+                            err
+                        )
                     }
                 };
             }
@@ -264,7 +265,7 @@ impl Subscriber {
     /// * `name` The name to refer to the subscriber.
     /// * `port`: The UDP port to listen for new messages on.
     /// * `callback`: The function to call on incoming data.
-    pub fn with_udp_port<T>(name: &'static str, port: u16, callback: Callback<T>) -> Subscriber
+    pub fn with_udp_port<T>(name: &str, port: u16, callback: Callback<T>) -> Subscriber
     where
         T: Debug + DeserializeOwned + Serialize + 'static,
     {
@@ -277,11 +278,7 @@ impl Subscriber {
     /// * `name` The name to refer to the subscriber.
     /// * `path`: The unix socket path to bind the server to.
     /// * `callback`: The function to call on incoming data.
-    pub fn with_unix_datagram<T>(
-        name: &'static str,
-        path: &Path,
-        callback: Callback<T>,
-    ) -> Subscriber
+    pub fn with_unix_datagram<T>(name: &str, path: &Path, callback: Callback<T>) -> Subscriber
     where
         T: Debug + DeserializeOwned + Serialize + 'static,
     {

@@ -8,8 +8,11 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::config::{self, Config};
-use crate::rpc::{Callback, RpcClient, RpcError, RpcServer};
+use crate::config::{self, Config, PubSubKind};
+pub use crate::pubsub::Callback as PubSubCallback;
+use crate::pubsub::{Publisher, Subscriber};
+pub use crate::rpc::Callback as RpcCallback;
+use crate::rpc::{RpcClient, RpcError, RpcServer};
 
 /// Process helper for RPC and PubSub communication.
 ///
@@ -24,6 +27,7 @@ pub struct Process {
     config: Config,
     name: String,
     rpc: HashMap<String, RpcServer>,
+    subscribers: HashMap<String, Subscriber>,
 }
 
 impl Process {
@@ -59,6 +63,7 @@ impl Process {
             config: config.clone(),
             name: String::from(name),
             rpc: HashMap::new(),
+            subscribers: HashMap::new(),
         })
     }
 
@@ -77,6 +82,7 @@ impl Process {
             config: config.clone(),
             name: String::from(name),
             rpc: HashMap::new(),
+            subscribers: HashMap::new(),
         }
     }
 
@@ -90,12 +96,12 @@ impl Process {
         }
     }
 
-    fn rpc_config_name(process_name: &str, rpc_name: &str) -> String {
-        format!("{}.{}", process_name, rpc_name)
+    fn config_name(process_name: &str, channel_name: &str) -> String {
+        format!("{}.{}", process_name, channel_name)
     }
 
     fn get_rpc_from_config(&self, process_name: &str, rpc_name: &str) -> Option<SocketAddr> {
-        let config_name = Process::rpc_config_name(process_name, rpc_name);
+        let config_name = Process::config_name(process_name, rpc_name);
         self.config.get_rpc(&config_name)
     }
 
@@ -131,7 +137,7 @@ impl Process {
                 let socket_path = match &self.run_dir {
                     Some(dir) => config::unix_socket_dir(&dir)
                         .as_path()
-                        .join(Process::rpc_config_name(process_name, rpc_name)),
+                        .join(Process::config_name(process_name, rpc_name)),
                     None => {
                         return Err(RpcError::IoError(IoError::new(
                             ErrorKind::Unsupported,
@@ -159,7 +165,7 @@ impl Process {
     pub fn create_rpc<T, U>(
         &mut self,
         name: &'static str,
-        callback: Callback<T, U>,
+        callback: RpcCallback<T, U>,
     ) -> Result<(), IoError>
     where
         T: Debug + DeserializeOwned + Serialize + 'static,
@@ -176,7 +182,7 @@ impl Process {
                 if addr.ip() != IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)) {
                     let msg = format!(
                         "RPC {} refers to remote endpoint: {}",
-                        Process::rpc_config_name(&self.name, name),
+                        Process::config_name(&self.name, name),
                         addr
                     );
                     return Err(IoError::new(ErrorKind::AddrNotAvailable, msg));
@@ -194,6 +200,116 @@ impl Process {
         Ok(())
     }
 
+    /// Publish a message to a topic.
+    ///
+    /// Args:
+    /// * `topic`: The PubSub topic to publish to.
+    /// * `message`: The data to publish.
+    pub fn publish_to_topic<T>(&self, topic: &str, message: &T) -> Result<(), IoError>
+    where
+        T: Debug + DeserializeOwned + Serialize + 'static,
+    {
+        if !self.config.has_pubsub(topic) {
+            return Err(IoError::new(
+                ErrorKind::NotFound,
+                format!("PubSub topic not in config: {}", topic),
+            ));
+        }
+
+        // TODO make it not necessary to do this every message. Needs refactoring usage of generic
+        // parameters in the Publisher struct.
+        let topic_name = Process::config_name(&self.name, topic);
+        let mut publisher = Publisher::<T>::new(&topic_name);
+        for config in self.config.get_pubsub_topic(topic).unwrap().iter() {
+            if let Some(addr) = config.udp() {
+                publisher.add_udp_endpoint(addr);
+            } else if let Some(name) = config.unix() {
+                let socket_path = match &self.run_dir {
+                    Some(dir) => config::unix_socket_dir(&dir)
+                        .as_path()
+                        .join(Process::config_name(&name, topic)),
+                    None => {
+                        return Err(IoError::new(
+                            ErrorKind::Unsupported,
+                            format!("Process {} has no run directory", self.name),
+                        ));
+                    }
+                };
+                publisher.add_unix_datagram_endpoint(&socket_path);
+            } else {
+                panic!("impossible");
+            }
+        }
+
+        publisher.publish(message);
+        Ok(())
+    }
+
+    /// Subscribe to a topic.
+    ///
+    /// Args:
+    /// * `topic`: The PubSub topic to subscribe to.
+    /// * `callback`: The function that is called when the PubSub subscriber receives data.
+    pub fn subscribe_to_topic<T>(
+        &mut self,
+        topic: &str,
+        callback: PubSubCallback<T>,
+    ) -> Result<(), IoError>
+    where
+        T: Debug + DeserializeOwned + Serialize + 'static,
+    {
+        if self.subscribers.contains_key(topic) {
+            return Err(IoError::new(
+                ErrorKind::AlreadyExists,
+                format!("Already subscribed to topic: {}", topic),
+            ));
+        }
+
+        let topic_config = match self.config.get_pubsub_endpoint(topic, &self.name) {
+            Some(config) => config,
+            None => {
+                return Err(IoError::new(
+                    ErrorKind::NotFound,
+                    format!("PubSub topic not in config: {}", topic),
+                ))
+            }
+        };
+
+        let topic_name = format!("{}.{}", topic_config.name(), topic);
+        match topic_config.config() {
+            PubSubKind::Udp(addr) => {
+                if addr.ip() != IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)) {
+                    let msg = format!(
+                        "PubSub topic {} refers to remote endpoint: {}",
+                        Process::config_name(&self.name, topic),
+                        addr
+                    );
+                    return Err(IoError::new(ErrorKind::AddrNotAvailable, msg));
+                }
+                assert!(self
+                    .subscribers
+                    .insert(
+                        String::from(topic),
+                        Subscriber::with_udp_port(&topic_name, addr.port(), callback),
+                    )
+                    .is_none());
+            }
+            PubSubKind::Unix => {
+                let socket_path = self.unix_socket_base()?.with_extension(topic);
+                assert!(self
+                    .subscribers
+                    .insert(
+                        String::from(topic),
+                        Subscriber::with_unix_datagram(&topic_name, &socket_path, callback),
+                    )
+                    .is_none());
+            }
+        }
+
+        log::trace!("Subscribed to topic: {}", topic_name);
+        Ok(())
+    }
+
     /// Return the name of the `Process` instance.
     pub fn name(&self) -> String {
         self.name.clone()
@@ -203,8 +319,14 @@ impl Process {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Instant;
+
+    use parking_lot::Mutex;
 
     use super::*;
+    use crate::config::PubSubEndpoint;
 
     fn setup_logging() {
         let _ = env_logger::builder()
@@ -226,7 +348,7 @@ mod tests {
         let mut cfg = Config::new();
         cfg.add_rpc(
             &format!("{}.{}", server_name, rpc_name),
-            &SocketAddr::new(
+            SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 portpicker::pick_unused_port().unwrap(),
             ),
@@ -234,7 +356,7 @@ mod tests {
         .unwrap();
         cfg.add_rpc(
             &format!("{}.invalid", server_name),
-            &SocketAddr::new(
+            SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
                 portpicker::pick_unused_port().unwrap(),
             ),
@@ -308,5 +430,85 @@ mod tests {
         assert!(result.is_ok());
         let result = result.unwrap();
         assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn create_process_with_pubsub() {
+        setup_logging();
+
+        let mut cfg = Config::new();
+        assert!(cfg
+            .add_pubsub(
+                "counter",
+                &PubSubEndpoint::new_udp_endpoint(
+                    "udp",
+                    SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                        portpicker::pick_unused_port().unwrap(),
+                    )
+                )
+            )
+            .is_ok());
+        assert!(cfg
+            .add_pubsub("counter", &PubSubEndpoint::new_unix_endpoint("unix",))
+            .is_ok());
+        let cfg = cfg;
+        log::trace!(
+            "pubsub test config:\n{}",
+            serde_yaml::to_string(&cfg).unwrap()
+        );
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.yaml");
+        assert!(cfg.write_yaml(&config_path).is_ok());
+
+        let unix_sub = Process::from_config_file("unix", &config_path);
+        assert!(unix_sub.is_ok());
+        let mut unix_sub = unix_sub.unwrap();
+        let unix_counter = Arc::new(Mutex::new(0 as usize));
+        {
+            let counter = Arc::clone(&unix_counter);
+            assert!(unix_sub
+                .subscribe_to_topic::<i32>(
+                    "counter",
+                    Box::new(move |_| {
+                        log::trace!("got a message on the unix subscriber");
+                        *counter.lock() += 1;
+                    })
+                )
+                .is_ok());
+        }
+
+        let udp_sub = Process::from_config_file("udp", &config_path);
+        assert!(udp_sub.is_ok());
+        let mut udp_sub = udp_sub.unwrap();
+        let udp_counter = Arc::new(Mutex::new(0 as usize));
+        {
+            let counter = Arc::clone(&udp_counter);
+            assert!(udp_sub
+                .subscribe_to_topic::<i32>(
+                    "counter",
+                    Box::new(move |_| {
+                        log::trace!("got a message on the udp subscriber");
+                        *counter.lock() += 1;
+                    })
+                )
+                .is_ok());
+        }
+
+        let publisher = Process::from_config_file("publisher", &config_path);
+        assert!(publisher.is_ok());
+        let publisher = publisher.unwrap();
+        let start = Instant::now();
+        while Instant::now().duration_since(start) < Duration::from_secs(10) {
+            assert!(publisher.publish_to_topic("counter", &1).is_ok());
+            {
+                if *udp_counter.lock() > 0 && *unix_counter.lock() > 0 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(*unix_counter.lock() > 0);
+        assert!(*udp_counter.lock() > 0);
     }
 }

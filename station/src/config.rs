@@ -34,26 +34,59 @@ impl Display for ConfigError {
 
 impl Error for ConfigError {}
 
+/// What socket type to use for PubSub.
+#[derive(Clone, Debug, Eq, Deserialize, Hash, Serialize, PartialEq)]
+pub enum PubSubKind {
+    Udp(SocketAddr),
+    Unix,
+}
+
 /// Network endpoint configuration for a PubSub topic.
 #[derive(Clone, Debug, Eq, Deserialize, Hash, Serialize, PartialEq)]
-pub enum PubSubEndpoint {
-    Udp(SocketAddr),
-    Unix(String),
+pub struct PubSubEndpoint {
+    name: String,
+    config: PubSubKind,
 }
 
 impl PubSubEndpoint {
+    /// Create a PubSub endpoint config with a UDP address.
+    pub fn new_udp_endpoint(name: &str, addr: SocketAddr) -> PubSubEndpoint {
+        PubSubEndpoint {
+            name: String::from(name),
+            config: PubSubKind::Udp(addr),
+        }
+    }
+
+    /// Create a PubSub endpoint config with a name for generating a Unix socket path.
+    pub fn new_unix_endpoint(name: &str) -> PubSubEndpoint {
+        PubSubEndpoint {
+            name: String::from(name),
+            config: PubSubKind::Unix,
+        }
+    }
+
+    /// Return the name of the endpoint.
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    /// Return the endpoint configuration.
+    pub fn config(&self) -> PubSubKind {
+        self.config.clone()
+    }
+
     /// Get the UDP socket address for a UDP endpoint.
     pub fn udp(&self) -> Option<SocketAddr> {
-        match self {
-            PubSubEndpoint::Udp(addr) => Some(*addr),
+        match &self.config {
+            PubSubKind::Udp(addr) => Some(*addr),
             _ => None,
         }
     }
 
     /// Get the name to use to construct a Unix socket.
     pub fn unix(&self) -> Option<String> {
-        match self {
-            PubSubEndpoint::Unix(name) => Some(String::from(name)),
+        match &self.config {
+            PubSubKind::Unix => Some(self.name.clone()),
             _ => None,
         }
     }
@@ -87,9 +120,9 @@ impl Config {
     /// Args:
     /// * `name`: The name to associate the config with.
     /// * `addr`: The TCP socket address to use for the RPC listener.
-    pub fn add_rpc(&mut self, name: &str, addr: &SocketAddr) -> ConfigResult<()> {
+    pub fn add_rpc(&mut self, name: &str, addr: SocketAddr) -> ConfigResult<()> {
         self.err_rpc_exists(name)?;
-        assert!(self.rpc.insert(String::from(name), *addr).is_none());
+        assert!(self.rpc.insert(String::from(name), addr).is_none());
         Ok(())
     }
 
@@ -109,23 +142,60 @@ impl Config {
     /// Args:
     /// * `topic`: The PubSub topic to add the endpoint to.
     /// * `endpoint`: An endpoint for a publisher to publish to.
-    pub fn add_pubsub(&mut self, topic: &str, endpoint: &PubSubEndpoint) {
+    pub fn add_pubsub(&mut self, topic: &str, endpoint: &PubSubEndpoint) -> ConfigResult<()> {
         let topic_config = self
             .pubsub
             .entry(String::from(topic))
             .or_insert(HashSet::new());
+
+        // disallow duplicate topic names even if the config is different
+        for config in topic_config.iter() {
+            if config.name() == endpoint.name() {
+                return Err(ConfigError::new(&format!(
+                    "Endpoint for PubSub topic {} exists: {}",
+                    topic,
+                    endpoint.name()
+                )));
+            }
+        }
+
         topic_config.insert(endpoint.clone());
+        Ok(())
     }
 
-    /// Get a set of PubSub subscriber endpoints for a topic.
+    /// Get the config for a PubSub endpoint for a topic.
     ///
     /// Args:
     /// * `topic`: The PubSub topic to fetch endpoint configs for.
-    pub fn get_pubsub(&self, topic: &str) -> Option<HashSet<PubSubEndpoint>> {
+    /// * `endpoint`: The name of the PubSub endpoint to query.
+    pub fn get_pubsub_endpoint(&self, topic: &str, endpoint: &str) -> Option<PubSubEndpoint> {
+        let topic_config = match self.get_pubsub_topic(topic) {
+            Some(config) => config,
+            None => return None,
+        };
+
+        for config in topic_config.iter() {
+            if config.name() == String::from(endpoint) {
+                return Some(config.clone());
+            }
+        }
+        None
+    }
+
+    /// Get the set of endpoint configs for a PubSub topic.
+    ///
+    /// Args:
+    /// * `topic`: The PubSub topic to fetch endpoint configs for.
+    pub fn get_pubsub_topic(&self, topic: &str) -> Option<HashSet<PubSubEndpoint>> {
         match self.pubsub.get(topic) {
             Some(config) => Some(config.clone()),
             None => None,
         }
+    }
+
+    /// Check if a config exists for a PubSub topic.
+    pub fn has_pubsub(&self, topic: &str) -> bool {
+        self.pubsub.contains_key(topic)
     }
 
     /// Read a config from a YAML file.
@@ -240,10 +310,10 @@ mod tests {
     fn add_items_to_config() {
         setup_logging();
         let mut config = Config::new();
-        assert!(config.add_rpc("tcp", &pick_unused_addr()).is_ok());
+        assert!(config.add_rpc("tcp", pick_unused_addr()).is_ok());
 
         // should error out, as the config exists.
-        let result = config.add_rpc("tcp", &pick_unused_addr());
+        let result = config.add_rpc("tcp", pick_unused_addr());
         assert!(result.is_err());
         log::debug!("{}", result.err().unwrap());
 
@@ -260,15 +330,36 @@ mod tests {
     fn load_save_config_file() {
         setup_logging();
         let mut config = Config::new();
-        assert!(config.add_rpc("cats", &pick_unused_addr()).is_ok());
-        assert!(config.add_rpc("dogs", &pick_unused_addr()).is_ok());
-        config.add_pubsub("turtles", &PubSubEndpoint::Unix(String::from("rabbits")));
-        config.add_pubsub("turtles", &PubSubEndpoint::Udp(pick_unused_addr()));
-        config.add_pubsub("coffee", &PubSubEndpoint::Unix(String::from("donuts")));
+        assert!(config.add_rpc("cats", pick_unused_addr()).is_ok());
+        assert!(config.add_rpc("dogs", pick_unused_addr()).is_ok());
+        assert!(config
+            .add_pubsub("turtles", &PubSubEndpoint::new_unix_endpoint("rabbits"))
+            .is_ok());
+        assert!(config
+            .add_pubsub(
+                "turtles",
+                &PubSubEndpoint::new_udp_endpoint("shell", pick_unused_addr()),
+            )
+            .is_ok());
+        assert!(config
+            .add_pubsub("coffee", &PubSubEndpoint::new_unix_endpoint("donuts"))
+            .is_ok());
         // coffee.donuts is already inserted, so re-inserting does nothing, but is fine
-        config.add_pubsub("coffee", &PubSubEndpoint::Unix(String::from("donuts")));
-        config.add_pubsub("coffee", &PubSubEndpoint::Udp(pick_unused_addr()));
-        config.add_pubsub("coffee", &PubSubEndpoint::Udp(pick_unused_addr()));
+        assert!(config
+            .add_pubsub("coffee", &PubSubEndpoint::new_unix_endpoint("donuts"))
+            .is_err());
+        assert!(config
+            .add_pubsub(
+                "coffee",
+                &PubSubEndpoint::new_udp_endpoint("latte", pick_unused_addr()),
+            )
+            .is_ok());
+        assert!(config
+            .add_pubsub(
+                "coffee",
+                &PubSubEndpoint::new_udp_endpoint("mocha", pick_unused_addr()),
+            )
+            .is_ok());
         let config = config;
         assert!(config.get_rpc("cats").is_some());
 
@@ -289,10 +380,27 @@ mod tests {
         assert!(recovered_config.get_rpc("cats").is_some());
         let addr = recovered_config.get_rpc("cats").unwrap();
         assert!(addr.port() > 0);
-        assert!(recovered_config.get_pubsub("turtles").is_some());
-        assert_eq!(recovered_config.get_pubsub("turtles").unwrap().len(), 2);
-        assert!(recovered_config.get_pubsub("coffee").is_some());
-        assert_eq!(recovered_config.get_pubsub("coffee").unwrap().len(), 3);
+        assert!(recovered_config
+            .get_pubsub_endpoint("turtles", "rabbits")
+            .is_some());
+        assert!(recovered_config
+            .get_pubsub_endpoint("turtles", "shell")
+            .is_some());
+        assert!(recovered_config
+            .get_pubsub_endpoint("turtles", "shells")
+            .is_none());
+        assert!(recovered_config
+            .get_pubsub_endpoint("coffee", "donuts")
+            .is_some());
+        assert!(recovered_config
+            .get_pubsub_endpoint("coffee", "latte")
+            .is_some());
+        assert!(recovered_config
+            .get_pubsub_endpoint("coffee", "mocha")
+            .is_some());
+        assert!(recovered_config
+            .get_pubsub_endpoint("coffee", "ice-cap")
+            .is_none());
     }
 
     #[test]
