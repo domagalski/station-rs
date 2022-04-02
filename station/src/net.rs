@@ -156,7 +156,6 @@ pub fn write_socket(socket: &mut impl Socket, data: impl Serialize) -> Result<us
     socket.write(&message)
 }
 
-//pub fn write_stop_signal(socket: &mut impl Socket, name: &str) {
 pub fn write_stop_signal<S: Socket>(socket: Result<S, IoError>, name: &str) {
     // the only reason why the socket endpoint shouldn't connect is that the server thread it is
     // connecting to for sending a shutdown signal has already been shut down, in which case, not
@@ -164,7 +163,7 @@ pub fn write_stop_signal<S: Socket>(socket: Result<S, IoError>, name: &str) {
     if let Ok(mut socket) = socket {
         match socket.write(construct_payload((), STOP_KEYWORD).as_slice()) {
             Ok(size) => log::trace!("{}: wrote stop requested signal of {} bytes", name, size),
-            Err(err) => log::trace!("{}: stop request had error: {}", name, err),
+            Err(err) => log::error!("{}: stop request had error: {}", name, err),
         }
     }
 }
@@ -177,7 +176,7 @@ pub fn ping(socket: &mut impl Socket, timeout: Duration) -> bool {
     match socket.write(&signal) {
         Ok(size) => log::trace!("wrote ping requested signal of {} bytes", size),
         Err(err) => {
-            log::trace!("ping request had error: {}", err);
+            log::error!("ping request had error: {}", err);
             return false;
         }
     }
@@ -192,12 +191,28 @@ pub fn ping(socket: &mut impl Socket, timeout: Duration) -> bool {
     return true;
 }
 
+pub enum RecvType<T> {
+    Message(T),
+    Ping,
+    StopRequest,
+}
+
+impl<T> RecvType<T> {
+    pub fn to_string(&self) -> String {
+        match self {
+            RecvType::Message(_) => format!("RecvType::Message<{}>", any::type_name::<T>()),
+            RecvType::Ping => String::from("RecvType::Ping"),
+            RecvType::StopRequest => String::from("RecvType::StopRequest"),
+        }
+    }
+}
+
 pub fn recv<S: Socket, T: DeserializeOwned + Serialize>(
     socket: &mut S,
     timeout: Option<Duration>,
     error_keyword: &str,
     is_result_type: bool,
-) -> Result<T, IoError> {
+) -> Result<RecvType<T>, IoError> {
     let _ = socket.set_timeout(timeout);
     let mut buffer: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
     let n_bytes = socket.read(&mut buffer)?;
@@ -213,8 +228,8 @@ pub fn recv<S: Socket, T: DeserializeOwned + Serialize>(
     let keyword: u32 = BE::read_u32(&buffer[..keyword_bound]);
     let message_size: usize = match keyword {
         MESSAGE_KEYWORD => BE::read_u64(&buffer[keyword_bound..HEADER_SIZE]) as usize,
-        PING_KEYWORD => return Err(IoError::new(ErrorKind::WriteZero, "ping")),
-        STOP_KEYWORD => return Err(IoError::new(ErrorKind::Interrupted, "stop requested")),
+        PING_KEYWORD => return Ok(RecvType::Ping),
+        STOP_KEYWORD => return Ok(RecvType::StopRequest),
         ERROR_KEYWORD => {
             let error_msg: &str = bincode::deserialize(&buffer[HEADER_SIZE..n_bytes]).unwrap();
             let error_msg = format!("{}: {}", error_keyword, error_msg);
@@ -263,7 +278,7 @@ pub fn recv<S: Socket, T: DeserializeOwned + Serialize>(
         };
 
         match response {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => Ok(RecvType::Message(resp)),
             Err(err) => Err(IoError::new(
                 ErrorKind::Other,
                 format!("{}: {}", error_keyword, &err.to_string()),
@@ -272,7 +287,7 @@ pub fn recv<S: Socket, T: DeserializeOwned + Serialize>(
     } else {
         let message_bytes = message_bytes.as_slice();
         match bincode::deserialize(&message_bytes) {
-            Ok(message) => Ok(message),
+            Ok(message) => Ok(RecvType::Message(message)),
             Err(_) => {
                 let err_str = format!("failed to deserialize to {}", any::type_name::<T>());
                 Err(IoError::new(

@@ -17,7 +17,7 @@ use regex::Regex;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::net;
+use crate::net::{self, RecvType};
 
 // the callback type for passing closures into a new RPC handler.
 pub type Callback<T, U> = Box<dyn Send + Fn(T) -> Result<U, String>>;
@@ -114,7 +114,7 @@ impl RpcServer {
                 let req = match listener.recv_request() {
                     Ok(req) => req,
                     Err(err) => {
-                        log::trace!(
+                        log::error!(
                             "recv_request error on RPC handler '{}' with error:\n{}",
                             name,
                             err
@@ -123,13 +123,17 @@ impl RpcServer {
                     }
                 };
 
-                let resp = match (*callback)(req) {
-                    Ok(resp) => Ok(resp),
-                    Err(err) => Err(err.to_string()),
+                let resp = match req {
+                    RecvType::Message(req) => match (*callback)(req) {
+                        Ok(resp) => Ok(resp),
+                        Err(err) => Err(err.to_string()),
+                    },
+                    RecvType::Ping => Err(String::from("ping")),
+                    RecvType::StopRequest => Err(String::from("stop requested")),
                 };
 
                 if let Err(err) = listener.send_response(resp) {
-                    log::trace!(
+                    log::error!(
                         "send_response error on RPC handler '{}' with error:\n{}",
                         name,
                         err
@@ -157,7 +161,7 @@ impl RpcServer {
         T: Debug + DeserializeOwned + Serialize + 'static,
         U: Debug + DeserializeOwned + Serialize + 'static,
     {
-        log::debug!("Creating RPC server with TCP port: {}", port);
+        log::info!("Creating RPC server '{}' with TCP port: {}", name, port);
         RpcServer::new(name, ListenPort::TcpPort(port), callback)
     }
 
@@ -176,7 +180,11 @@ impl RpcServer {
         T: Debug + DeserializeOwned + Serialize + 'static,
         U: Debug + DeserializeOwned + Serialize + 'static,
     {
-        log::debug!("Creating RPC server with Unix socket: {}", path.display());
+        log::info!(
+            "Creating RPC server '{}' with Unix socket: {}",
+            name,
+            path.display()
+        );
         RpcServer::new(name, ListenPort::Unix(PathBuf::from(path)), callback)
     }
 
@@ -188,7 +196,7 @@ impl RpcServer {
     /// Stop the RPC server.
     pub fn stop(&mut self) {
         if self.is_running() {
-            log::debug!("Stopping RPC handler: {}", self.name);
+            log::info!("Stopping RPC handler: {}", self.name);
             *self.stop_requested.write() = true;
             self.send_stop_signal();
             self.thread.take().unwrap().join().unwrap();
@@ -242,13 +250,13 @@ where
 
     /// Create an RPC client pointing to a TCP socket address.
     pub fn with_tcp_addr(addr: SocketAddr) -> RpcClient<T, U> {
-        log::debug!("Creating RPC client to TCP endpoint: {}", addr);
+        log::info!("Creating RPC client to TCP endpoint: {}", addr);
         RpcClient::new(SendPort::TcpSocket(addr))
     }
 
     /// Create an RPC client pointing to a Unix stream socket address.
     pub fn with_unix_socket(path: &Path) -> RpcClient<T, U> {
-        log::debug!("Creating RPC client to Unix socket: {}", path.display());
+        log::info!("Creating RPC client to Unix socket: {}", path.display());
         RpcClient::new(SendPort::Unix(PathBuf::from(path)))
     }
 
@@ -270,7 +278,16 @@ where
         }
 
         match self.sender.send_recv(request, timeout) {
-            Ok(response) => Ok(response),
+            Ok(response) => {
+                if let RecvType::Message(response) = response {
+                    Ok(response)
+                } else {
+                    Err(RpcError::IoError(IoError::new(
+                        ErrorKind::InvalidData,
+                        format!("unexpected response: {}", response.to_string()),
+                    )))
+                }
+            }
             Err(err) => {
                 match err.kind() {
                     ErrorKind::Other => {
@@ -313,7 +330,7 @@ where
     T: DeserializeOwned + Serialize,
     U: DeserializeOwned + Serialize,
 {
-    fn recv_request(&self) -> Result<T, IoError>;
+    fn recv_request(&self) -> Result<RecvType<T>, IoError>;
 
     fn send_response(&self, resp: Result<U, String>) -> Result<(), IoError>;
 }
@@ -323,7 +340,7 @@ where
     T: DeserializeOwned + Serialize,
     U: DeserializeOwned + Serialize,
 {
-    fn send_recv(&self, req: T, timeout: Duration) -> Result<U, IoError>;
+    fn send_recv(&self, req: T, timeout: Duration) -> Result<RecvType<U>, IoError>;
     fn ping(&self, timeout: Duration) -> bool;
 }
 
@@ -370,7 +387,7 @@ where
     T: DeserializeOwned + Serialize,
     U: DeserializeOwned + Serialize,
 {
-    fn recv_request(&self) -> Result<T, IoError> {
+    fn recv_request(&self) -> Result<RecvType<T>, IoError> {
         if self.stream.borrow().is_some() {
             return Err(IoError::new(
                 ErrorKind::AlreadyExists,
@@ -443,7 +460,7 @@ where
     T: DeserializeOwned + Serialize,
     U: DeserializeOwned + Serialize,
 {
-    fn recv_request(&self) -> Result<T, IoError> {
+    fn recv_request(&self) -> Result<RecvType<T>, IoError> {
         if self.stream.borrow().is_some() {
             return Err(IoError::new(
                 ErrorKind::AlreadyExists,
@@ -489,7 +506,7 @@ where
     T: DeserializeOwned + Serialize,
     U: DeserializeOwned + Serialize,
 {
-    fn send_recv(&self, req: T, timeout: Duration) -> Result<U, IoError> {
+    fn send_recv(&self, req: T, timeout: Duration) -> Result<RecvType<U>, IoError> {
         let mut stream = TcpStream::connect(self.addr)?;
         net::write_socket(&mut stream, req)?;
         net::recv(&mut stream, Some(timeout), RPC_ERROR, true)
@@ -522,7 +539,7 @@ where
     T: DeserializeOwned + Serialize,
     U: DeserializeOwned + Serialize,
 {
-    fn send_recv(&self, req: T, timeout: Duration) -> Result<U, IoError> {
+    fn send_recv(&self, req: T, timeout: Duration) -> Result<RecvType<U>, IoError> {
         let mut stream = UnixStream::connect(&self.path)?;
         net::write_socket(&mut stream, req)?;
         net::recv(&mut stream, Some(timeout), RPC_ERROR, true)

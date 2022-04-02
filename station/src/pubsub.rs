@@ -16,7 +16,7 @@ use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::net::{self, Udp, UnixUdp};
+use crate::net::{self, RecvType, Udp, UnixUdp};
 
 // the callback type for passing messages into the callback
 pub type Callback<T> = Box<dyn Send + Fn(T)>;
@@ -244,9 +244,13 @@ impl Subscriber {
             };
             while !*is_stop_requested.read() {
                 match subscriber.recv() {
-                    Ok(msg) => (*callback)(msg),
+                    Ok(msg) => match msg {
+                        RecvType::Message(msg) => (*callback)(msg),
+                        RecvType::Ping => log::error!("Subscriber cannot be pinged!"),
+                        RecvType::StopRequest => log::info!("Stop requested!"),
+                    },
                     Err(err) => {
-                        log::trace!(
+                        log::error!(
                             "recv error on Subscriber '{}' with error:\n{}",
                             subscriber_name,
                             err
@@ -302,7 +306,7 @@ impl Subscriber {
     /// Stop the Subscriber
     pub fn stop(&mut self) {
         if self.is_running() {
-            log::debug!("Stopping Subscriber: {}", self.name);
+            log::info!("Stopping Subscriber: {}", self.name);
             *self.stop_requested.write() = true;
             self.send_stop_signal();
             self.thread.take().unwrap().join().unwrap();
@@ -340,7 +344,7 @@ trait SubscribeHandler<T>
 where
     T: DeserializeOwned + Serialize,
 {
-    fn recv(&self) -> Result<T, IoError>;
+    fn recv(&self) -> Result<RecvType<T>, IoError>;
 }
 
 struct UdpSubscriber {
@@ -352,7 +356,7 @@ impl UdpSubscriber {
         let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
         let listener = UdpSocket::bind(addr).expect(&format!("Cannot bind to UDP port: {}", port));
 
-        log::debug!(
+        log::info!(
             "Creating UDP subscriber '{}' listening on address: {}",
             name,
             addr
@@ -367,7 +371,7 @@ impl<T> SubscribeHandler<T> for UdpSubscriber
 where
     T: DeserializeOwned + Serialize,
 {
-    fn recv(&self) -> Result<T, IoError> {
+    fn recv(&self) -> Result<RecvType<T>, IoError> {
         let mut udp = self.udp.borrow_mut().take().unwrap();
         let response = net::recv(&mut udp, None, PUBSUB_ERROR, false);
         *self.udp.borrow_mut() = Some(udp);
@@ -381,7 +385,7 @@ struct UnixDatagramSubscriber {
 
 impl UnixDatagramSubscriber {
     fn new(name: &str, path: &Path) -> UnixDatagramSubscriber {
-        log::debug!(
+        log::info!(
             "Creating Unix socket subscriber '{}' listening on path: {}",
             name,
             path.display()
@@ -399,7 +403,7 @@ impl<T> SubscribeHandler<T> for UnixDatagramSubscriber
 where
     T: DeserializeOwned + Serialize,
 {
-    fn recv(&self) -> Result<T, IoError> {
+    fn recv(&self) -> Result<RecvType<T>, IoError> {
         let mut unix = self.unix.borrow_mut().take().unwrap();
         let response = net::recv(&mut unix, None, PUBSUB_ERROR, false);
         *self.unix.borrow_mut() = Some(unix);
