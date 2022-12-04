@@ -3,14 +3,15 @@
 use std::any;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::Result as IoResult;
+use std::io::{ErrorKind, Read, Result as IoResult, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use mio::net::{UnixDatagram, UnixListener};
+use mio::net::{UnixDatagram, UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::messages::Payload;
 
@@ -29,7 +30,7 @@ pub struct EventHandler<'a> {
     pubsub_socket: UnixDatagram,
     poller: Poll,
     events: Events,
-    responses: HashMap<u32, Box<dyn Fn(&[u8]) -> Vec<u8> + 'a>>,
+    responses: HashMap<u32, Box<dyn Fn(&[u8]) -> Result<Value, String> + 'a>>,
     callbacks: HashMap<u32, Box<dyn Fn(&[u8]) + 'a>>,
 }
 
@@ -128,23 +129,60 @@ impl<'a> EventHandler<'a> {
                 let data: T = match serde_json::from_slice(data) {
                     Ok(data) => data,
                     Err(_) => {
-                        let error: Result<U, String> = Err(format!(
+                        return Err(format!(
                             "Failed to deserialize input for callback {} as {}",
                             id,
                             any::type_name::<T>()
                         ));
-                        return serde_json::to_vec(&error).unwrap();
                     }
                 };
-                let value = response(data);
-                serde_json::to_vec(&value).unwrap()
+                match response(data) {
+                    Ok(value) => Ok(serde_json::to_value(value).unwrap()),
+                    Err(err) => Err(err),
+                }
             }),
         );
         true
     }
 
     fn handle_rpc(&self) {
-        panic!("RPC not implemented");
+        loop {
+            match self.rpc_socket.accept() {
+                Ok((mut connection, _)) => self.respond_to_rpc(&mut connection),
+                Err(err) => {
+                    if err.kind() == ErrorKind::WouldBlock {
+                        break;
+                    } else {
+                        panic!("failed to accept connection: {}", err);
+                    }
+                }
+            }
+        }
+    }
+
+    fn respond_to_rpc(&self, connection: &mut UnixStream) {
+        let size = match connection.read(&mut self.buffer.borrow_mut()) {
+            Ok(size) => size,
+            Err(err) => {
+                log::error!("Failed to read RPC request: {}", err);
+                return;
+            }
+        };
+
+        let response =
+            match serde_json::from_slice::<Payload>(&self.buffer.borrow().as_slice()[0..size]) {
+                Ok(payload) => match self.responses.get(&payload.id) {
+                    Some(handler) => handler(&payload.data),
+                    None => Err(format!("Unknown request ID: {}", payload.id)),
+                },
+                Err(err) => Err(format!("Failed to deserialize request: {}", err)),
+            };
+
+        let response = serde_json::to_vec(&response).unwrap();
+        match connection.write(&response) {
+            Ok(_) => (),
+            Err(err) => log::error!("Failed to write response: {}", err),
+        }
     }
 
     fn handle_pubsub(&self) {
@@ -156,8 +194,8 @@ impl<'a> EventHandler<'a> {
             }
         };
 
-        let payload: Payload =
-            match serde_json::from_slice(&self.buffer.borrow().as_slice()[0..size]) {
+        let payload =
+            match serde_json::from_slice::<Payload>(&self.buffer.borrow().as_slice()[0..size]) {
                 Ok(payload) => payload,
                 Err(err) => {
                     log::error!("Failed to deserialize PubSub message: {}", err);
@@ -179,7 +217,7 @@ impl<'a> EventHandler<'a> {
 mod test {
     use std::io::Write;
 
-    use mio::net::UnixDatagram;
+    use serde::Deserialize;
 
     use super::*;
 
@@ -237,13 +275,73 @@ mod test {
             id: 0,
             data: serde_json::to_vec(&increment).unwrap(),
         };
-        let data = serde_json::to_vec(&payload).unwrap();
-        let result = publisher.send_to(&data, pubsub_path).unwrap();
-        assert_eq!(result, data.len());
+        let payload = serde_json::to_vec(&payload).unwrap();
+        let result = publisher.send_to(&payload, pubsub_path).unwrap();
+        assert_eq!(result, payload.len());
 
         assert!(event_handler.wait(Duration::from_millis(0)).unwrap());
         assert_eq!(event_handler.process_events().len(), 0);
 
         assert_eq!(counter.count(), increment);
+    }
+
+    #[test]
+    fn test_rpc() {
+        setup_logging();
+
+        #[derive(Serialize, Deserialize)]
+        struct AddRequest {
+            x: i32,
+            y: i32,
+        }
+
+        // struct that counts how many requests have been made to it.
+        struct Adder {
+            n_reqs: RefCell<usize>,
+        }
+
+        impl Adder {
+            fn new() -> Adder {
+                Adder {
+                    n_reqs: RefCell::new(0),
+                }
+            }
+
+            fn add(&self, request: &AddRequest) -> i32 {
+                *self.n_reqs.borrow_mut() += 1;
+                return request.x + request.y;
+            }
+
+            fn num_requests(&self) -> usize {
+                *self.n_reqs.borrow()
+            }
+        }
+
+        let adder = Adder::new();
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut event_handler = EventHandler::new(tempdir.path()).unwrap();
+        assert!(!event_handler.wait(Duration::from_millis(0)).unwrap());
+        assert!(event_handler.assign_response(0, Box::new(|req| Ok(adder.add(&req)))));
+
+        let rpc_path = tempdir.path().join("rpc");
+        let mut client = UnixStream::connect(&rpc_path).unwrap();
+        let request = AddRequest { x: 2, y: 4 };
+        let payload = Payload {
+            id: 0,
+            data: serde_json::to_vec(&request).unwrap(),
+        };
+        let payload = serde_json::to_vec(&payload).unwrap();
+        let result = client.write(&payload).unwrap();
+        assert_eq!(result, payload.len());
+
+        assert!(event_handler.wait(Duration::from_millis(0)).unwrap());
+        assert_eq!(event_handler.process_events().len(), 0);
+        let mut buffer: [u8; 1000] = [0; 1000];
+        let size = client.read(&mut buffer).unwrap();
+        let result: Result<i32, String> = serde_json::from_slice(&buffer[0..size]).unwrap();
+        let result = result.unwrap();
+        assert_eq!(result, request.x + request.y);
+        assert_eq!(adder.num_requests(), 1);
     }
 }
