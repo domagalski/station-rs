@@ -1,5 +1,6 @@
 //! Handle IPC events
 
+use std::any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Result as IoResult;
@@ -8,6 +9,7 @@ use std::time::Duration;
 
 use mio::net::{UnixDatagram, UnixListener};
 use mio::{Events, Interest, Poll, Token};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::messages::Payload;
@@ -80,12 +82,32 @@ impl<'a> EventHandler<'a> {
         unknown_tokens
     }
 
-    pub fn assign_callback(&mut self, id: u32, callback: Box<dyn Fn(Value) + 'a>) -> bool {
+    pub fn assign_callback<T: DeserializeOwned + 'a>(
+        &mut self,
+        id: u32,
+        callback: Box<dyn Fn(T) + 'a>,
+    ) -> bool {
         if self.callbacks.contains_key(&id) {
             return false;
         }
 
-        self.callbacks.insert(id, callback);
+        self.callbacks.insert(
+            id,
+            Box::new(move |data| {
+                let data: T = match serde_json::from_value(data) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        log::error!(
+                            "Failed to deserialize input for callback {} as {}",
+                            id,
+                            any::type_name::<T>()
+                        );
+                        return;
+                    }
+                };
+                callback(data);
+            }),
+        );
         true
     }
 
@@ -177,12 +199,7 @@ mod test {
                 }
             }
 
-            fn increment(&self, data: Value) {
-                let value: usize = match serde_json::from_value(data) {
-                    Ok(value) => value,
-                    Err(_) => return,
-                };
-
+            fn increment(&self, value: usize) {
                 *self.count.borrow_mut() += value;
             }
 
@@ -197,8 +214,7 @@ mod test {
         let tempdir = tempfile::tempdir().unwrap();
         let mut event_handler = EventHandler::new(tempdir.path()).unwrap();
         assert!(!event_handler.wait(Duration::from_millis(0)).unwrap());
-
-        event_handler.assign_callback(0, Box::new(|data| counter.increment(data)));
+        assert!(event_handler.assign_callback(0, Box::new(|value| counter.increment(value))));
 
         let publisher = UnixDatagram::unbound().unwrap();
         let pubsub_path = tempdir.path().join("pubsub");
