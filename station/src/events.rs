@@ -10,7 +10,6 @@ use std::time::Duration;
 use mio::net::{UnixDatagram, UnixListener};
 use mio::{Events, Interest, Poll, Token};
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 
 use crate::messages::Payload;
 
@@ -32,7 +31,7 @@ pub struct EventHandler<'a> {
     poller: Poll,
     events: Events,
     responses: HashMap<u32, Box<dyn Response>>,
-    callbacks: HashMap<u32, Box<dyn Fn(Value) + 'a>>,
+    callbacks: HashMap<u32, Box<dyn Fn(&[u8]) + 'a>>,
 }
 
 impl<'a> EventHandler<'a> {
@@ -94,7 +93,7 @@ impl<'a> EventHandler<'a> {
         self.callbacks.insert(
             id,
             Box::new(move |data| {
-                let data: T = match serde_json::from_value(data) {
+                let data: T = match serde_json::from_slice(data) {
                     Ok(data) => data,
                     Err(_) => {
                         log::error!(
@@ -142,21 +141,13 @@ impl<'a> EventHandler<'a> {
                 }
             };
 
-        if !self.callbacks.contains_key(&payload.id) {
-            log::error!("Dropping PubSub with unknown ID: {}", payload.id);
-            return;
-        }
-
-        let data: Value = match serde_json::from_slice(&payload.data) {
-            Ok(data) => data,
-            Err(err) => {
-                log::error!("PubSub payload is invalid JSON: {}", err);
+        match self.callbacks.get(&payload.id) {
+            Some(callback) => callback(&payload.data),
+            None => {
+                log::error!("Dropping PubSub with unknown ID: {}", payload.id);
                 return;
             }
-        };
-
-        let callback = self.callbacks.get(&payload.id).unwrap();
-        callback(data);
+        }
     }
 }
 
