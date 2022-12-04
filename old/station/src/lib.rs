@@ -5,7 +5,13 @@
 //! request-response model. This library aims for flexibility in the networking protocol used to
 //! transmit messages.
 
-pub(crate) mod events;
-mod messages;
+pub(crate) mod net;
+pub(crate) mod pubsub;
+pub(crate) mod rpc;
 
-pub use events::EventHandler;
+pub mod config;
+pub mod process;
+
+pub use config::Config;
+pub use process::Process;
+pub use rpc::RpcError;

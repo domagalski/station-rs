@@ -1,7 +1,10 @@
 # station
-A network-based interprocess communication (IPC) library written in Rust.
+A networked interprocess communication (IPC) library written in Rust.
 
-I'm writing this to be useful to me. It might not be useful for you.
+I'm writing this to be useful to me. It might not be useful for you. Some
+things mentioned here might not be fully implemented or subject to change. v1.0
+shall be the first release that is meant to be stable, usable and fully
+featured. Anything before that is subject to be whatever I feel like it is.
 
 ## Structure
 
