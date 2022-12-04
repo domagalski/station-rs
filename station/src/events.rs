@@ -10,6 +10,7 @@ use std::time::Duration;
 use mio::net::{UnixDatagram, UnixListener};
 use mio::{Events, Interest, Poll, Token};
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use crate::messages::Payload;
 
@@ -22,15 +23,13 @@ const RPC_TOKEN: Token = Token(0);
 const PUBSUB_SOCKET: &str = "pubsub";
 const PUBSUB_TOKEN: Token = Token(1);
 
-pub trait Response {}
-
 pub struct EventHandler<'a> {
     buffer: RefCell<Vec<u8>>,
     rpc_socket: UnixListener,
     pubsub_socket: UnixDatagram,
     poller: Poll,
     events: Events,
-    responses: HashMap<u32, Box<dyn Response>>,
+    responses: HashMap<u32, Box<dyn Fn(&[u8]) -> Vec<u8> + 'a>>,
     callbacks: HashMap<u32, Box<dyn Fn(&[u8]) + 'a>>,
 }
 
@@ -110,12 +109,37 @@ impl<'a> EventHandler<'a> {
         true
     }
 
-    pub fn assign_response(&mut self, id: u32, response: Box<dyn Response>) -> bool {
+    pub fn assign_response<T, U>(
+        &mut self,
+        id: u32,
+        response: Box<dyn Fn(T) -> Result<U, String> + 'a>,
+    ) -> bool
+    where
+        T: DeserializeOwned + 'a,
+        U: Serialize + 'a,
+    {
         if self.responses.contains_key(&id) {
             return false;
         }
 
-        self.responses.insert(id, response);
+        self.responses.insert(
+            id,
+            Box::new(move |data| {
+                let data: T = match serde_json::from_slice(data) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        let error: Result<U, String> = Err(format!(
+                            "Failed to deserialize input for callback {} as {}",
+                            id,
+                            any::type_name::<T>()
+                        ));
+                        return serde_json::to_vec(&error).unwrap();
+                    }
+                };
+                let value = response(data);
+                serde_json::to_vec(&value).unwrap()
+            }),
+        );
         true
     }
 
