@@ -5,6 +5,5 @@
 //! request-response model. See the `EventHandler` docs for more details.
 
 pub mod events;
-mod messages;
 
 pub use events::EventHandler;

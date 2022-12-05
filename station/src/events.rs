@@ -10,10 +10,8 @@ use std::time::Duration;
 use mio::net::{UnixDatagram, UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use crate::messages::Payload;
 
 const MAX_EVENTS: usize = 64;
 const BUFFER_SIZE: usize = 1_000_000;
@@ -23,6 +21,12 @@ const RPC_TOKEN: Token = Token(0);
 
 const PUBSUB_SOCKET: &str = "pubsub";
 const PUBSUB_TOKEN: Token = Token(1);
+
+#[derive(Deserialize, Serialize)]
+pub struct Payload {
+    pub id: u32,
+    pub data: Vec<u8>,
+}
 
 /// The event handler is for handling interprocess communication (IPC) via sending messages over a
 /// network. There are two main patterns of events: PubSub (see `assign_callback` and RPC (see
