@@ -1,4 +1,4 @@
-//! Handle IPC events
+//! Handle IPC events.
 
 use std::any;
 use std::cell::RefCell;
@@ -24,6 +24,20 @@ const RPC_TOKEN: Token = Token(0);
 const PUBSUB_SOCKET: &str = "pubsub";
 const PUBSUB_TOKEN: Token = Token(1);
 
+/// The event handler is for handling interprocess communication (IPC) via sending messages over a
+/// network. There are two main patterns of events: PubSub (see `assign_callback` and RPC (see
+/// `assign_response`).
+///
+/// PubSub events are handled where some callback processes messages it
+/// receives, but does not issue a response to the publisher of the message. In EventHander, PubSub
+/// events are received on datagram-type sockets. RPC events are where a client sends a message to
+/// the event handler with the expectation of a response.
+///
+/// The event handler is not thread-safe. The typical usage of it is to define a main loop where the
+/// event handler waits for events, then processes them. If events need to be processed in another
+/// thread, the callbacks or response handlers must handle any multi-threading that is necessary.
+/// In any case, callbacks and response handlers should execute quickly, as they are executed
+/// serially in order of reception of requests/messages sent to the event handler.
 pub struct EventHandler<'a> {
     buffer: RefCell<Vec<u8>>,
     rpc_socket: UnixListener,
@@ -35,12 +49,20 @@ pub struct EventHandler<'a> {
 }
 
 impl<'a> EventHandler<'a> {
-    pub fn new(socket_path: &Path) -> IoResult<EventHandler> {
+    /// Create an event handler. If the event handler cannot be created, return an error.
+    ///
+    /// Args:
+    /// * `name`: A name to refer to the event handler.
+    /// * `socket_dir`: The root directory for which to create unix sockets.
+    pub fn new(name: &str, socket_dir: &Path) -> IoResult<EventHandler<'a>> {
         let buffer = RefCell::new(Vec::new());
         buffer.borrow_mut().resize(BUFFER_SIZE, 0);
 
-        let mut rpc_socket = UnixListener::bind(socket_path.join(RPC_SOCKET))?;
-        let mut pubsub_socket = UnixDatagram::bind(socket_path.join(PUBSUB_SOCKET))?;
+        let rpc_path = socket_dir.join(format!("{}.{}", name, RPC_SOCKET));
+        let pubsub_path = socket_dir.join(format!("{}.{}", name, PUBSUB_SOCKET));
+
+        let mut rpc_socket = UnixListener::bind(rpc_path)?;
+        let mut pubsub_socket = UnixDatagram::bind(pubsub_path)?;
 
         let poller = Poll::new()?;
         poller
@@ -61,26 +83,13 @@ impl<'a> EventHandler<'a> {
         })
     }
 
-    pub fn wait(&mut self, timeout: Duration) -> IoResult<bool> {
-        self.poller.poll(&mut self.events, Some(timeout))?;
-        Ok(!self.events.is_empty())
-    }
-
-    pub fn process_events(&self) -> Vec<Token> {
-        let mut unknown_tokens = Vec::new();
-        for event in self.events.iter() {
-            let token = event.token();
-            match token {
-                RPC_TOKEN => self.handle_rpc(),
-                PUBSUB_TOKEN => self.handle_pubsub(),
-                token => {
-                    unknown_tokens.push(token);
-                }
-            }
-        }
-        unknown_tokens
-    }
-
+    /// Assign a callback for when a message of type `T` arrives at the event handler, which
+    /// processes the messages it receives without returning a response to the message sender.
+    ///
+    /// Args:
+    /// * `id`: An identifier of the callback handler. No two callbacks can share the same ID and if
+    /// a callback handler with this ID already exists, `assign_callback` will return `false`.
+    /// * `callback`: A function to process a message of type `T` upon reception.
     pub fn assign_callback<T: DeserializeOwned + 'a>(
         &mut self,
         id: u32,
@@ -110,6 +119,14 @@ impl<'a> EventHandler<'a> {
         true
     }
 
+    /// Assign a response for when a message of type `T` arrives at the event handler, which either
+    /// returns a response of type `U` or a string describing some error.
+    ///
+    /// Args:
+    /// * `id`: An identifier of the response handler. No two response handlers can share the same
+    /// ID and if a response handler with this ID already exists, `assign_callback` will return
+    /// `false`.
+    /// * `callback`: A function to process a message of type `T` upon reception.
     pub fn assign_response<T, U>(
         &mut self,
         id: u32,
@@ -145,6 +162,33 @@ impl<'a> EventHandler<'a> {
         true
     }
 
+    fn handle_pubsub(&self) {
+        let size = match self.pubsub_socket.recv(&mut self.buffer.borrow_mut()) {
+            Ok(size) => size,
+            Err(err) => {
+                log::error!("Failed to receive message on subscriber: {}", err);
+                return;
+            }
+        };
+
+        let payload =
+            match serde_json::from_slice::<Payload>(&self.buffer.borrow().as_slice()[0..size]) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    log::error!("Failed to deserialize PubSub message: {}", err);
+                    return;
+                }
+            };
+
+        match self.callbacks.get(&payload.id) {
+            Some(callback) => callback(&payload.data),
+            None => {
+                log::error!("Dropping PubSub with unknown ID: {}", payload.id);
+                return;
+            }
+        }
+    }
+
     fn handle_rpc(&self) {
         loop {
             match self.rpc_socket.accept() {
@@ -158,6 +202,24 @@ impl<'a> EventHandler<'a> {
                 }
             }
         }
+    }
+
+    /// Process all events that are currently awaiting processing. If there are registered events
+    /// that are not a part of the event handler (e.g. responses from some network resource), the
+    /// associated event tokens for those events are returned.
+    pub fn process_events(&self) -> Vec<Token> {
+        let mut unknown_tokens = Vec::new();
+        for event in self.events.iter() {
+            let token = event.token();
+            match token {
+                RPC_TOKEN => self.handle_rpc(),
+                PUBSUB_TOKEN => self.handle_pubsub(),
+                token => {
+                    unknown_tokens.push(token);
+                }
+            }
+        }
+        unknown_tokens
     }
 
     fn respond_to_rpc(&self, connection: &mut UnixStream) {
@@ -185,31 +247,14 @@ impl<'a> EventHandler<'a> {
         }
     }
 
-    fn handle_pubsub(&self) {
-        let size = match self.pubsub_socket.recv(&mut self.buffer.borrow_mut()) {
-            Ok(size) => size,
-            Err(err) => {
-                log::error!("Failed to receive message on subscriber: {}", err);
-                return;
-            }
-        };
-
-        let payload =
-            match serde_json::from_slice::<Payload>(&self.buffer.borrow().as_slice()[0..size]) {
-                Ok(payload) => payload,
-                Err(err) => {
-                    log::error!("Failed to deserialize PubSub message: {}", err);
-                    return;
-                }
-            };
-
-        match self.callbacks.get(&payload.id) {
-            Some(callback) => callback(&payload.data),
-            None => {
-                log::error!("Dropping PubSub with unknown ID: {}", payload.id);
-                return;
-            }
-        }
+    /// Wait for events to arrive at the handler. If there is at least one event ready, this will
+    /// return `true`. If no event has arrived within the timeout, then `false` is returned.
+    ///
+    /// Args:
+    /// * `timeout`: The maximum amount of time to wait for events.
+    pub fn wait(&mut self, timeout: Duration) -> IoResult<bool> {
+        self.poller.poll(&mut self.events, Some(timeout))?;
+        Ok(!self.events.is_empty())
     }
 }
 
@@ -265,12 +310,12 @@ mod test {
         let increment = 5 as usize;
 
         let tempdir = tempfile::tempdir().unwrap();
-        let mut event_handler = EventHandler::new(tempdir.path()).unwrap();
+        let mut event_handler = EventHandler::new("test", tempdir.path()).unwrap();
         assert!(!event_handler.wait(Duration::from_millis(0)).unwrap());
         assert!(event_handler.assign_callback(0, Box::new(|value| counter.increment(value))));
 
         let publisher = UnixDatagram::unbound().unwrap();
-        let pubsub_path = tempdir.path().join("pubsub");
+        let pubsub_path = tempdir.path().join("test.pubsub");
         let payload = Payload {
             id: 0,
             data: serde_json::to_vec(&increment).unwrap(),
@@ -320,11 +365,11 @@ mod test {
         let adder = Adder::new();
 
         let tempdir = tempfile::tempdir().unwrap();
-        let mut event_handler = EventHandler::new(tempdir.path()).unwrap();
+        let mut event_handler = EventHandler::new("test", tempdir.path()).unwrap();
         assert!(!event_handler.wait(Duration::from_millis(0)).unwrap());
         assert!(event_handler.assign_response(0, Box::new(|req| Ok(adder.add(&req)))));
 
-        let rpc_path = tempdir.path().join("rpc");
+        let rpc_path = tempdir.path().join("test.rpc");
         let mut client = UnixStream::connect(&rpc_path).unwrap();
         let request = AddRequest { x: 2, y: 4 };
         let payload = Payload {

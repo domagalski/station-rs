@@ -2,10 +2,9 @@
 //!
 //! This crate for IPC communication over a network with multiple machines or locally with a single
 //! machine. The implemented IPC patterns are IPC via a publish-subscribe model as well as a
-//! request-response model. This library aims for flexibility in the networking protocol used to
-//! transmit messages.
+//! request-response model. See the `EventHandler` docs for more details.
 
-pub(crate) mod events;
+pub mod events;
 mod messages;
 
 pub use events::EventHandler;
