@@ -4,7 +4,7 @@ use std::any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Result as IoResult, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mio::net::{UnixDatagram, UnixListener, UnixStream};
@@ -28,21 +28,21 @@ pub struct Payload {
     pub data: Vec<u8>,
 }
 
-/// The event handler is for handling interprocess communication (IPC) via sending messages over a
+/// The event server is for handling interprocess communication (IPC) via sending messages over a
 /// network. There are two main patterns of events: PubSub (see `assign_callback` and RPC (see
 /// `assign_response`).
 ///
 /// PubSub events are handled where some callback processes messages it
 /// receives, but does not issue a response to the publisher of the message. In EventHander, PubSub
 /// events are received on datagram-type sockets. RPC events are where a client sends a message to
-/// the event handler with the expectation of a response.
+/// the event server with the expectation of a response.
 ///
-/// The event handler is not thread-safe. The typical usage of it is to define a main loop where the
-/// event handler waits for events, then processes them. If events need to be processed in another
+/// The event server is not thread-safe. The typical usage of it is to define a main loop where the
+/// event server waits for events, then processes them. If events need to be processed in another
 /// thread, the callbacks or response handlers must handle any multi-threading that is necessary.
 /// In any case, callbacks and response handlers should execute quickly, as they are executed
-/// serially in order of reception of requests/messages sent to the event handler.
-pub struct EventHandler<'a> {
+/// serially in order of reception of requests/messages sent to the event server.
+pub struct Server<'a> {
     buffer: RefCell<Vec<u8>>,
     rpc_socket: UnixListener,
     pubsub_socket: UnixDatagram,
@@ -52,13 +52,13 @@ pub struct EventHandler<'a> {
     callbacks: HashMap<u32, Box<dyn Fn(&[u8]) + 'a>>,
 }
 
-impl<'a> EventHandler<'a> {
-    /// Create an event handler. If the event handler cannot be created, return an error.
+impl<'a> Server<'a> {
+    /// Create an event server. If the event server cannot be created, return an error.
     ///
     /// Args:
-    /// * `name`: A name to refer to the event handler.
+    /// * `name`: A name to refer to the event server.
     /// * `socket_dir`: The root directory for which to create unix sockets.
-    pub fn new(name: &str, socket_dir: &Path) -> IoResult<EventHandler<'a>> {
+    pub fn new(name: &str, socket_dir: &Path) -> IoResult<Server<'a>> {
         let buffer = RefCell::new(Vec::new());
         buffer.borrow_mut().resize(BUFFER_SIZE, 0);
 
@@ -76,7 +76,7 @@ impl<'a> EventHandler<'a> {
             .registry()
             .register(&mut pubsub_socket, PUBSUB_TOKEN, Interest::READABLE)?;
 
-        Ok(EventHandler {
+        Ok(Server {
             buffer,
             rpc_socket,
             pubsub_socket,
@@ -87,7 +87,7 @@ impl<'a> EventHandler<'a> {
         })
     }
 
-    /// Assign a callback for when a message of type `T` arrives at the event handler, which
+    /// Assign a callback for when a message of type `T` arrives at the event server, which
     /// processes the messages it receives without returning a response to the message sender.
     ///
     /// Args:
@@ -123,7 +123,7 @@ impl<'a> EventHandler<'a> {
         true
     }
 
-    /// Assign a response for when a message of type `T` arrives at the event handler, which either
+    /// Assign a response for when a message of type `T` arrives at the event server, which either
     /// returns a response of type `U` or a string describing some error.
     ///
     /// Args:
@@ -209,7 +209,7 @@ impl<'a> EventHandler<'a> {
     }
 
     /// Process all events that are currently awaiting processing. If there are registered events
-    /// that are not a part of the event handler (e.g. responses from some network resource), the
+    /// that are not a part of the event server (e.g. responses from some network resource), the
     /// associated event tokens for those events are returned.
     pub fn process_events(&self) -> Vec<Token> {
         let mut unknown_tokens = Vec::new();
@@ -259,6 +259,18 @@ impl<'a> EventHandler<'a> {
     pub fn wait(&mut self, timeout: Duration) -> IoResult<bool> {
         self.poller.poll(&mut self.events, Some(timeout))?;
         Ok(!self.events.is_empty())
+    }
+}
+
+pub struct Client {
+    socket_dir: PathBuf,
+}
+
+impl Client {
+    pub fn new(socket_dir: &Path) -> Client {
+        Client {
+            socket_dir: socket_dir.to_path_buf(),
+        }
     }
 }
 
@@ -314,9 +326,9 @@ mod test {
         let increment = 5 as usize;
 
         let tempdir = tempfile::tempdir().unwrap();
-        let mut event_handler = EventHandler::new("test", tempdir.path()).unwrap();
-        assert!(!event_handler.wait(Duration::from_millis(0)).unwrap());
-        assert!(event_handler.assign_callback(0, Box::new(|value| counter.increment(value))));
+        let mut server = Server::new("test", tempdir.path()).unwrap();
+        assert!(!server.wait(Duration::from_millis(0)).unwrap());
+        assert!(server.assign_callback(0, Box::new(|value| counter.increment(value))));
 
         let publisher = UnixDatagram::unbound().unwrap();
         let pubsub_path = tempdir.path().join("test.pubsub");
@@ -328,8 +340,8 @@ mod test {
         let result = publisher.send_to(&payload, pubsub_path).unwrap();
         assert_eq!(result, payload.len());
 
-        assert!(event_handler.wait(Duration::from_millis(0)).unwrap());
-        assert_eq!(event_handler.process_events().len(), 0);
+        assert!(server.wait(Duration::from_millis(0)).unwrap());
+        assert_eq!(server.process_events().len(), 0);
 
         assert_eq!(counter.count(), increment);
     }
@@ -369,9 +381,9 @@ mod test {
         let adder = Adder::new();
 
         let tempdir = tempfile::tempdir().unwrap();
-        let mut event_handler = EventHandler::new("test", tempdir.path()).unwrap();
-        assert!(!event_handler.wait(Duration::from_millis(0)).unwrap());
-        assert!(event_handler.assign_response(0, Box::new(|req| Ok(adder.add(&req)))));
+        let mut server = Server::new("test", tempdir.path()).unwrap();
+        assert!(!server.wait(Duration::from_millis(0)).unwrap());
+        assert!(server.assign_response(0, Box::new(|req| Ok(adder.add(&req)))));
 
         let rpc_path = tempdir.path().join("test.rpc");
         let mut client = UnixStream::connect(&rpc_path).unwrap();
@@ -384,8 +396,8 @@ mod test {
         let result = client.write(&payload).unwrap();
         assert_eq!(result, payload.len());
 
-        assert!(event_handler.wait(Duration::from_millis(0)).unwrap());
-        assert_eq!(event_handler.process_events().len(), 0);
+        assert!(server.wait(Duration::from_millis(0)).unwrap());
+        assert_eq!(server.process_events().len(), 0);
         let mut buffer: [u8; 1000] = [0; 1000];
         let size = client.read(&mut buffer).unwrap();
         let result: Result<i32, String> = serde_json::from_slice(&buffer[0..size]).unwrap();
